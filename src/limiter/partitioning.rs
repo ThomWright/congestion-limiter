@@ -5,59 +5,109 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use conv::{ConvAsUtil, ConvUtil};
 use tokio::{
-    sync::{oneshot, RwLock},
+    sync::{oneshot, OwnedSemaphorePermit, RwLock},
     time::timeout,
 };
 
 use crate::{
-    limiter::{DefaultLimiter, Limiter, Outcome, Token},
+    limiter::{Outcome, Token},
     limits::LimitAlgorithm,
 };
 
-use super::{
-    token::{self, TokenInner},
-    AtomicCapacityUnit, CapacityUnit,
-};
+use super::{AtomicCapacityUnit, CapacityUnit, Releaser, TotalLimiter};
 
 type StateIndex = usize;
 
+/// A partitioned [Limiter], using some fraction of the concurrency limit.
 #[derive(Debug)]
-pub(crate) struct Scheduler {
-    _total_in_flight: Arc<AtomicCapacityUnit>,
+pub struct PartitionedLimiter<T> {
+    state_index: usize,
+    scheduler: Arc<Scheduler<T>>,
+}
+
+/// Divides up capacity between multiple weighted partitions.
+#[derive(Debug)]
+pub(crate) struct Scheduler<T> {
+    total_limiter: TotalLimiter<T>,
+
+    waiters: RwLock<LinkedList<(StateIndex, oneshot::Sender<OwnedSemaphorePermit>)>>,
 
     partition_states: Vec<PartitionState>,
-
-    waiters: RwLock<LinkedList<(StateIndex, oneshot::Sender<Token>)>>,
 }
 
 #[derive(Debug)]
 struct PartitionState {
+    /// Normalised, sum of fractions = 1.
     fraction: f64,
-    /// Shared with [Token]s.
-    in_flight: Arc<AtomicCapacityUnit>,
+    in_flight: AtomicCapacityUnit,
+    // job_queue: Mutex<VecDeque<Arc<Notify>>>,
 }
 
-/// A partition, using some fraction of the concurrency limit.
-#[derive(Debug)]
-pub struct PartitionedLimiter<L> {
-    /// Partition state used for scheduling is stored at this index in the [Scheduler].
-    index: StateIndex,
-
-    scheduler: Arc<Scheduler>,
-    limiter: Arc<DefaultLimiter<L>>,
-}
-
-impl<L: LimitAlgorithm + Sync> DefaultLimiter<L> {
-    /// Divide up this limiter into a set of partitions with the given relative weights.
+impl<T> PartitionedLimiter<T>
+where
+    T: LimitAlgorithm + Send + 'static,
+{
+    /// Create a set of limiters, one per partition, with the given weights.
     ///
     /// The provided weights will be normalised. E.g. weights of 2, 2 and 4 will result in
     /// partitions of 25%, 25% and 50% of the total limit, respectively.
     ///
     /// `weights` must not be empty.
-    pub fn create_static_partitions(self, weights: Vec<f64>) -> Vec<PartitionedLimiter<L>> {
+    pub fn new(limit_algo: T, weights: Vec<f64>) -> Vec<Self> {
+        let num_partitions = weights.len();
+
+        let total_limiter = TotalLimiter::new(limit_algo);
+        let scheduler = Scheduler::new(total_limiter, weights);
+
+        let mut partitions = Vec::with_capacity(num_partitions);
+        for i in 0..partitions.len() {
+            partitions.push(Self {
+                state_index: i,
+                scheduler: scheduler.clone(),
+            });
+        }
+
+        partitions
+    }
+
+    /// Try to immediately acquire a concurrency [Token].
+    ///
+    /// Returns `None` if there are none available.
+    pub async fn try_acquire(self: &Arc<Self>) -> Option<Token> {
+        self.scheduler
+            .try_acquire(self.state_index)
+            .await
+            .map(|permit| self.mint_token(permit))
+    }
+
+    /// Try to acquire a concurrency [Token], waiting for `duration` if there are none available.
+    ///
+    /// Returns `None` if there are none available after `duration`.
+    pub async fn acquire_timeout(self: &Arc<Self>, duration: Duration) -> Option<Token> {
+        self.scheduler
+            .acquire_timeout(duration, self.state_index)
+            .await
+            .map(|permit| self.mint_token(permit))
+    }
+
+    fn mint_token(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> Token {
+        Token::new(permit, Arc::clone(self))
+    }
+}
+
+impl<T> Scheduler<T>
+where
+    T: LimitAlgorithm + Send + 'static,
+{
+    /// Create a scheduler with the given weights.
+    ///
+    /// The provided weights will be normalised. E.g. weights of 2, 2 and 4 will result in
+    /// partitions of 25%, 25% and 50% of the total limit, respectively.
+    ///
+    /// `weights` must not be empty.
+    pub(crate) fn new(total_limiter: TotalLimiter<T>, weights: Vec<f64>) -> Arc<Self> {
         assert!(!weights.is_empty(), "Must provide at least one weight");
 
         let total: f64 = weights.iter().sum();
@@ -69,66 +119,122 @@ impl<L: LimitAlgorithm + Sync> DefaultLimiter<L> {
 
             partition_states.push(PartitionState {
                 fraction,
-                in_flight: Arc::new(AtomicCapacityUnit::new(0)),
+                in_flight: AtomicCapacityUnit::new(0),
+                // job_queue: Mutex::new(VecDeque::default()),
             });
         }
 
-        let shared_limiter = Arc::new(self);
-        let scheduler = Arc::new(Scheduler {
-            _total_in_flight: shared_limiter.in_flight_shared(),
+        Arc::new(Scheduler {
+            total_limiter,
             partition_states,
             waiters: RwLock::default(),
-        });
-
-        let mut partitions = Vec::with_capacity(scheduler.partition_states.len());
-        for _ in scheduler.partition_states.iter() {
-            partitions.push(PartitionedLimiter {
-                index: partitions.len(),
-                scheduler: scheduler.clone(),
-                limiter: shared_limiter.clone(),
-            });
-        }
-
-        partitions
+        })
     }
-}
 
-impl Scheduler {
+    async fn try_acquire(self: &Arc<Self>, index: usize) -> Option<OwnedSemaphorePermit> {
+        let state = &self.partition_states[index];
+
+        let total_limit = self.total_limiter.limit();
+        if state.in_flight() < state.limit(total_limit) || self.spare_capacity(total_limit) > 0 {
+            match self.total_limiter.try_acquire().await {
+                Some(permit) => {
+                    self.partition_states[index].inc_in_flight();
+                    Some(permit)
+                }
+                None => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    async fn acquire_timeout(
+        &self,
+        duration: Duration,
+        index: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        let state = &self.partition_states[index];
+        match timeout(duration, async {
+            let total_limit = self.total_limiter.limit();
+            if state.in_flight() < state.limit(total_limit) || self.spare_capacity(total_limit) > 0
+            {
+                self.total_limiter.try_acquire().await
+            } else {
+                let (snd, rx) = oneshot::channel();
+                let mut waiters = self.waiters.write().await;
+                waiters.push_back((index, snd));
+                match rx.await {
+                    Ok(token) => Some(token),
+                    Err(_) => None,
+                }
+            }
+        })
+        .await
+        {
+            Ok(Some(permit)) => {
+                self.partition_states[index].inc_in_flight();
+                Some(permit)
+            }
+            Err(_) => None,
+            Ok(None) => None,
+        }
+    }
+
+    async fn update_limit(
+        &self,
+        outcome: Option<Outcome>,
+        latency: Duration,
+        _index: usize,
+    ) -> CapacityUnit {
+        self.total_limiter.update_limit(outcome, latency).await
+    }
+
     /// When a permit becomes available, give it to the next job in the queue with the higher
     /// priority.
     ///
     /// The underlying semaphore is simply a FIFO queue. Instead, what we want is to give out tokens
     /// to jobs in partitions which are under-subscribed in favour of partitions which are
     /// oversubscribed.
-    pub(crate) fn reuse_permit(self: Arc<Scheduler>, token_inner: TokenInner) {
+    fn reuse_permit(self: &Arc<Self>, permit: OwnedSemaphorePermit, index: usize) {
+        self.partition_states[index].dec_in_flight();
+
+        let scheduler = Arc::clone(self);
         tokio::spawn(async move {
             // TODO: A better strategy for choosing which waiter to wake, based on priority.
             // For now this is just a FIFO queue, so it's kind of pointless!
-            let waiter = self.waiters.write().await.pop_front();
+            let waiter = scheduler.waiters.write().await.pop_front();
             match waiter {
-                Some((index, waiter)) => {
-                    let token =
-                        Token::new_from_inner(token_inner).for_partition(token::Partition::new(
-                            self.partition_states[index].in_flight.clone(),
-                            self.clone(),
-                        ));
-                    match waiter.send(token) {
+                Some((_index, waiter)) => {
+                    match waiter.send(permit) {
                         Ok(()) => {}
                         Err(_) => {
                             // Nothing to do, the token will be dropped
                         }
                     };
                 }
-                None => drop(token_inner),
+                None => drop(permit),
             }
         });
     }
 
     /// Total spare capacity which can be used by any partition.
-    fn spare(&self, total_limit: CapacityUnit) -> CapacityUnit {
+    fn spare_capacity(&self, total_limit: CapacityUnit) -> CapacityUnit {
         self.partition_states
             .iter()
             .fold(0, |total, partition| total + partition.spare(total_limit))
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
+    async fn update_limit(&self, outcome: Option<Outcome>, latency: Duration) -> CapacityUnit {
+        self.scheduler
+            .update_limit(outcome, latency, self.state_index)
+            .await
+    }
+
+    fn release(&self, permit: OwnedSemaphorePermit) {
+        self.scheduler.reuse_permit(permit, self.state_index);
     }
 }
 
@@ -137,6 +243,14 @@ impl PartitionState {
 
     fn limit(&self, total_limit: CapacityUnit) -> CapacityUnit {
         fractional_limit(total_limit, self.fraction)
+    }
+
+    fn inc_in_flight(&self) -> CapacityUnit {
+        self.in_flight.fetch_add(1, atomic::Ordering::SeqCst) + 1
+    }
+
+    fn dec_in_flight(&self) -> CapacityUnit {
+        self.in_flight.fetch_sub(1, atomic::Ordering::SeqCst) - 1
     }
 
     fn in_flight(&self) -> CapacityUnit {
@@ -154,60 +268,6 @@ impl PartitionState {
     }
 }
 
-#[async_trait]
-impl<L> Limiter for PartitionedLimiter<L>
-where
-    L: LimitAlgorithm + Sync + Send + Debug,
-{
-    async fn try_acquire(&self) -> Option<Token> {
-        let state = &self.scheduler.partition_states[self.index];
-
-        let total_limit = self.limiter.limit();
-        if state.in_flight() < state.limit(total_limit) || self.scheduler.spare(total_limit) > 0 {
-            self.limiter.try_acquire().await.map(|token| {
-                token.for_partition(token::Partition::new(
-                    state.in_flight.clone(),
-                    self.scheduler.clone(),
-                ))
-            })
-        } else {
-            None
-        }
-    }
-
-    async fn acquire_timeout(&self, duration: Duration) -> Option<Token> {
-        let state = &self.scheduler.partition_states[self.index];
-        match timeout(duration, async {
-            let total_limit = self.limiter.limit();
-            if state.in_flight() < state.limit(total_limit) || self.scheduler.spare(total_limit) > 0
-            {
-                self.limiter.try_acquire().await
-            } else {
-                let (snd, rx) = oneshot::channel();
-                let mut waiters = self.scheduler.waiters.write().await;
-                waiters.push_back((self.index, snd));
-                match rx.await {
-                    Ok(token) => Some(token),
-                    Err(_) => None,
-                }
-            }
-        })
-        .await
-        {
-            Ok(Some(token)) => Some(token.for_partition(token::Partition::new(
-                state.in_flight.clone(),
-                self.scheduler.clone(),
-            ))),
-            Err(_) => None,
-            Ok(None) => None,
-        }
-    }
-
-    async fn release(&self, token: Token, outcome: Option<Outcome>) -> CapacityUnit {
-        self.limiter.release(token, outcome).await
-    }
-}
-
 fn fractional_limit(limit: CapacityUnit, fraction: f64) -> CapacityUnit {
     let limit_f64 = limit as f64 * fraction;
 
@@ -220,7 +280,8 @@ fn fractional_limit(limit: CapacityUnit, fraction: f64) -> CapacityUnit {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn todo() {
+    fn it_works() {
         // TODO: write some tests
+
     }
 }

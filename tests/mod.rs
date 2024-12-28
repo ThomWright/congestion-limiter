@@ -1,6 +1,6 @@
 #![expect(dead_code)]
 
-use std::{cmp::Reverse, collections::BinaryHeap, time::Duration};
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use conv::ValueFrom;
@@ -13,7 +13,7 @@ use statrs::{
 use tokio::time::Instant;
 
 use congestion_limiter::{
-    limiter::{DefaultLimiter, Limiter, LimiterState, Outcome, Token},
+    limiter::{Limiter, LimiterState, Outcome, Token},
     limits::{Aimd, LimitAlgorithm, Sample},
 };
 
@@ -50,14 +50,14 @@ impl LimitAlgorithm for LimitWrapper {
 
 /// Models a Poisson process.
 struct Client {
-    limiter: Option<DefaultLimiter<LimitWrapper>>,
+    limiter: Option<Arc<Limiter<LimitWrapper>>>,
 
     /// Poisson process, exponential interarrival times.
     interarrival: Exp,
 }
 
 struct Server {
-    limiter: Option<DefaultLimiter<LimitWrapper>>,
+    limiter: Option<Arc<Limiter<LimitWrapper>>>,
 
     latency: Erlang,
 
@@ -167,7 +167,7 @@ mod event_log {
 
 impl Client {
     /// Create a client which sends `rps` requests per second on average.
-    fn with_rps(limiter: Option<DefaultLimiter<LimitWrapper>>, rps: f64) -> Self {
+    fn with_rps(limiter: Option<Arc<Limiter<LimitWrapper>>>, rps: f64) -> Self {
         Self {
             limiter,
             interarrival: Exp::new(rps).unwrap(),
@@ -205,7 +205,7 @@ impl Client {
             .as_ref()
             .expect("Shouldn't call Client::res() unless it has a limiter");
 
-        limiter.release(token, Some(result)).await;
+        token.release(Some(result)).await;
 
         RequestOutcome {
             result,
@@ -221,7 +221,7 @@ impl Client {
 impl Server {
     /// Create a server with a concurrency limiter, a latency distribution and a failure rate.
     fn new(
-        limiter: Option<DefaultLimiter<LimitWrapper>>,
+        limiter: Option<Arc<Limiter<LimitWrapper>>>,
         latency_profile: LatencyProfile,
         failure_rate: f64,
     ) -> Self {
@@ -271,7 +271,7 @@ impl Server {
             Outcome::Overload
         };
 
-        limiter.release(token, Some(result)).await;
+        token.release(Some(result)).await;
 
         RequestOutcome {
             result,
@@ -548,12 +548,12 @@ async fn test() {
     let simulation_duration = Duration::from_secs(1);
 
     let client = Client::with_rps(
-        Some(DefaultLimiter::new(LimitWrapper::Aimd(
+        Some(Arc::new(Limiter::new(LimitWrapper::Aimd(
             Aimd::new_with_initial_limit(10)
                 .with_max_limit(20)
                 .decrease_factor(0.9)
                 .increase_by(1),
-        ))),
+        )))),
         100.0,
     );
 

@@ -230,11 +230,11 @@ impl Debug for Vegas {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Duration};
+    use std::{collections::VecDeque, sync::Arc, time::Duration};
 
     use itertools::Itertools;
 
-    use crate::limiter::{DefaultLimiter, Limiter, Outcome};
+    use crate::limiter::{Limiter, Outcome};
 
     use super::*;
 
@@ -243,7 +243,7 @@ mod tests {
         static INIT_LIMIT: usize = 10;
         let vegas = Vegas::new_with_initial_limit(INIT_LIMIT);
 
-        let limiter = DefaultLimiter::new(vegas);
+        let limiter = Arc::new(Limiter::new(vegas));
 
         /*
          * Warm up
@@ -258,7 +258,7 @@ mod tests {
         }
         for mut token in tokens {
             token.set_latency(Duration::from_millis(25));
-            limiter.release(token, Some(Outcome::Success)).await;
+            token.release(Some(Outcome::Success)).await;
         }
 
         /*
@@ -272,9 +272,9 @@ mod tests {
         }
         for mut token in tokens {
             token.set_latency(Duration::from_millis(25));
-            limiter.release(token, Some(Outcome::Success)).await;
+            token.release(Some(Outcome::Success)).await;
         }
-        let higher_limit = limiter.limit();
+        let higher_limit = limiter.state().limit();
         assert!(
             higher_limit > INIT_LIMIT,
             "Steady latency + high concurrency => increase limit"
@@ -291,10 +291,10 @@ mod tests {
             tokens.push(token);
         }
         for token in tokens {
-            limiter.release(token, Some(Outcome::Success)).await;
+            token.release(Some(Outcome::Success)).await;
         }
         assert!(
-            limiter.limit() < higher_limit,
+            limiter.state().limit() < higher_limit,
             "Increased latency => decrease limit"
         );
     }
@@ -313,7 +313,7 @@ mod tests {
         .with_min_window(Duration::ZERO)
         .with_max_window(Duration::ZERO);
 
-        let limiter = DefaultLimiter::new(vegas);
+        let limiter = Arc::new(Limiter::new(vegas));
 
         let mut next_tokens = VecDeque::with_capacity(9);
 
@@ -330,7 +330,7 @@ mod tests {
         let release_tokens = next_tokens.drain(0..).collect_vec();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(25));
-            limiter.release(token, Some(Outcome::Success)).await;
+            token.release(Some(Outcome::Success)).await;
 
             let token = limiter.try_acquire().await.unwrap();
             next_tokens.push_back(token);
@@ -342,13 +342,13 @@ mod tests {
         let release_tokens = next_tokens.drain(0..).collect_vec();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(25));
-            limiter.release(token, Some(Outcome::Success)).await;
+            token.release(Some(Outcome::Success)).await;
 
             let token = limiter.try_acquire().await.unwrap();
             next_tokens.push_back(token);
         }
 
-        let higher_limit = limiter.limit();
+        let higher_limit = limiter.state().limit();
         assert!(
             higher_limit > INIT_LIMIT,
             "Steady latency + high concurrency => increase limit. Limit: {}",
@@ -361,13 +361,13 @@ mod tests {
         let release_tokens = next_tokens.drain(0..).collect_vec();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(1000));
-            limiter.release(token, Some(Outcome::Success)).await;
+            token.release(Some(Outcome::Success)).await;
 
             let token = limiter.try_acquire().await.unwrap();
             next_tokens.push_back(token);
         }
 
-        let lower_limit = limiter.limit();
+        let lower_limit = limiter.state().limit();
         assert!(
             lower_limit < higher_limit,
             "Increased latency => decrease limit. Limit: {}",

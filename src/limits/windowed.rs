@@ -1,4 +1,4 @@
-use std::{ops::RangeInclusive, time::Duration};
+use std::{fmt::Debug, ops::RangeInclusive, time::Duration};
 
 use async_trait::async_trait;
 use tokio::{sync::Mutex, time::Instant};
@@ -92,7 +92,7 @@ impl<L: LimitAlgorithm, S: Aggregator> Windowed<L, S> {
 impl<L, S> LimitAlgorithm for Windowed<L, S>
 where
     L: LimitAlgorithm + Send + Sync,
-    S: Aggregator + Send + Sync,
+    S: Aggregator + Send + Sync + Debug,
 {
     fn limit(&self) -> usize {
         self.inner.limit()

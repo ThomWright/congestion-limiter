@@ -156,7 +156,7 @@ mod tests {
 
     use tokio::sync::Notify;
 
-    use crate::limiter::{DefaultLimiter, Limiter};
+    use crate::limiter::Limiter;
 
     use super::*;
 
@@ -168,12 +168,12 @@ mod tests {
 
         let release_notifier = Arc::new(Notify::new());
 
-        let limiter = DefaultLimiter::new(aimd).with_release_notifier(release_notifier.clone());
+        let limiter = Arc::new(Limiter::new(aimd).with_release_notifier(release_notifier.clone()));
 
         let token = limiter.try_acquire().await.unwrap();
-        limiter.release(token, Some(Outcome::Overload)).await;
+        token.release(Some(Outcome::Overload)).await;
         release_notifier.notified().await;
-        assert_eq!(limiter.limit(), 5, "overload: decrease");
+        assert_eq!(limiter.state().limit(), 5, "overload: decrease");
     }
 
     #[tokio::test]
@@ -183,14 +183,15 @@ mod tests {
             .increase_by(1)
             .with_min_utilisation_threshold(0.5);
 
-        let limiter = DefaultLimiter::new(aimd);
+        let limiter = Arc::new(Limiter::new(aimd));
 
         let token = limiter.try_acquire().await.unwrap();
         let _token = limiter.try_acquire().await.unwrap();
         let _token = limiter.try_acquire().await.unwrap();
 
-        limiter.release(token, Some(Outcome::Success)).await;
-        assert_eq!(limiter.limit(), 5, "success: increase");
+        token.release(Some(Outcome::Success)).await;
+
+        assert_eq!(limiter.state().limit(), 5, "success: increase");
     }
 
     #[tokio::test]
@@ -200,12 +201,16 @@ mod tests {
             .increase_by(1)
             .with_min_utilisation_threshold(0.5);
 
-        let limiter = DefaultLimiter::new(aimd);
+        let limiter = Arc::new(Limiter::new(aimd));
 
         let token = limiter.try_acquire().await.unwrap();
 
-        limiter.release(token, Some(Outcome::Success)).await;
-        assert_eq!(limiter.limit(), 4, "success: ignore when < half limit");
+        token.release(Some(Outcome::Success)).await;
+        assert_eq!(
+            limiter.state().limit(),
+            4,
+            "success: ignore when < half limit"
+        );
     }
 
     #[tokio::test]
@@ -214,10 +219,10 @@ mod tests {
             .decrease_factor(0.5)
             .increase_by(1);
 
-        let limiter = DefaultLimiter::new(aimd);
+        let limiter = Arc::new(Limiter::new(aimd));
 
         let token = limiter.try_acquire().await.unwrap();
-        limiter.release(token, None).await;
-        assert_eq!(limiter.limit(), 10, "ignore");
+        token.release(None).await;
+        assert_eq!(limiter.state().limit(), 10, "ignore");
     }
 }

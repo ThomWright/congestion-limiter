@@ -68,11 +68,11 @@ TODO:
 
 ```rust
 use std::sync::Arc;
-use congestion_limiter::{limits::Aimd, limiter::{DefaultLimiter, Limiter, Outcome}};
+use congestion_limiter::{limits::Aimd, limiter::{Limiter, Outcome}};
 
 // A limiter shared between request handler invocations.
 // This controls the concurrency of incoming requests.
-let limiter = Arc::new(DefaultLimiter::new(
+let limiter = Arc::new(Limiter::new(
     Aimd::new_with_initial_limit(10)
         .with_max_limit(20)
         .decrease_factor(0.9)
@@ -89,7 +89,7 @@ tokio_test::block_on(async move {
     // Do some work...
 
     // On request finish
-    limiter.release(token, Some(Outcome::Success)).await;
+    token.release(Some(Outcome::Success)).await;
 });
 ```
 

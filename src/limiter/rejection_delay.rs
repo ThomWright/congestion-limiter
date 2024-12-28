@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
+use crate::limits::LimitAlgorithm;
 
-use super::{Limiter, Outcome, Token};
+use super::{Limiter, Token};
 
 /// A wrapper which adds rejection delay.
 ///
@@ -12,24 +12,26 @@ use super::{Limiter, Outcome, Token};
 /// This can help reduce the rate of retries, especially when they are too eager and lack
 /// appropriate backoff.
 #[derive(Debug)]
-pub struct RejectionDelay {
+pub struct RejectionDelay<T> {
     delay: Duration,
-    inner: Box<dyn Limiter>,
+    inner: Arc<Limiter<T>>,
 }
 
-impl RejectionDelay {
+impl<T> RejectionDelay<T> {
     #[allow(missing_docs)]
-    pub fn new(delay: Duration, limiter: impl Limiter + 'static) -> Self {
+    pub fn new(delay: Duration, limiter: Limiter<T>) -> Self {
         Self {
             delay,
-            inner: Box::new(limiter),
+            inner: Arc::new(limiter),
         }
     }
 }
 
-#[async_trait]
-impl Limiter for RejectionDelay {
-    async fn try_acquire(&self) -> Option<Token> {
+impl<T: LimitAlgorithm + 'static> RejectionDelay<T> {
+    /// Try to immediately acquire a concurrency [Token].
+    ///
+    /// Returns `None` after a delay if there are none available.
+    pub async fn try_acquire(&self) -> Option<Token> {
         let token = self.inner.try_acquire().await;
 
         if token.is_none() {
@@ -39,7 +41,10 @@ impl Limiter for RejectionDelay {
         token
     }
 
-    async fn acquire_timeout(&self, duration: Duration) -> Option<Token> {
+    /// Try to acquire a concurrency [Token], waiting for `duration` if there are none available.
+    ///
+    /// Returns `None` after a delay if there are none available after `duration`.
+    pub async fn acquire_timeout(&self, duration: Duration) -> Option<Token> {
         let token = self.inner.acquire_timeout(duration).await;
 
         if token.is_none() {
@@ -47,10 +52,6 @@ impl Limiter for RejectionDelay {
         }
 
         token
-    }
-
-    async fn release(&self, token: Token, outcome: Option<Outcome>) -> usize {
-        self.inner.release(token, outcome).await
     }
 }
 
@@ -62,7 +63,7 @@ mod tests {
 
     use crate::assert_elapsed;
     use crate::{
-        limiter::{DefaultLimiter, Limiter, RejectionDelay},
+        limiter::{Limiter, RejectionDelay},
         limits::Fixed,
     };
 
@@ -72,7 +73,7 @@ mod tests {
 
         let delay = Duration::from_millis(5000);
 
-        let limiter = RejectionDelay::new(delay, DefaultLimiter::new(Fixed::new(1)));
+        let limiter = RejectionDelay::new(delay, Limiter::new(Fixed::new(1)));
 
         let _token = limiter.try_acquire().await.unwrap();
 
@@ -89,7 +90,7 @@ mod tests {
 
         let delay = Duration::from_millis(5000);
 
-        let limiter = RejectionDelay::new(delay, DefaultLimiter::new(Fixed::new(1)));
+        let limiter = RejectionDelay::new(delay, Limiter::new(Fixed::new(1)));
 
         let _token = limiter.try_acquire().await.unwrap();
 
