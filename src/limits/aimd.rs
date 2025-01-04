@@ -168,10 +168,10 @@ mod tests {
 
         let release_notifier = Arc::new(Notify::new());
 
-        let limiter = Arc::new(Limiter::new(aimd).with_release_notifier(release_notifier.clone()));
+        let limiter = Limiter::new_with_release_notifier(aimd, release_notifier.clone());
 
         let token = limiter.try_acquire().await.unwrap();
-        token.release(Some(Outcome::Overload)).await;
+        token.set_outcome(Outcome::Overload).await;
         release_notifier.notified().await;
         assert_eq!(limiter.state().limit(), 5, "overload: decrease");
     }
@@ -183,13 +183,13 @@ mod tests {
             .increase_by(1)
             .with_min_utilisation_threshold(0.5);
 
-        let limiter = Arc::new(Limiter::new(aimd));
+        let limiter = Limiter::new(aimd);
 
         let token = limiter.try_acquire().await.unwrap();
         let _token = limiter.try_acquire().await.unwrap();
         let _token = limiter.try_acquire().await.unwrap();
 
-        token.release(Some(Outcome::Success)).await;
+        token.set_outcome(Outcome::Success).await;
 
         assert_eq!(limiter.state().limit(), 5, "success: increase");
     }
@@ -201,11 +201,11 @@ mod tests {
             .increase_by(1)
             .with_min_utilisation_threshold(0.5);
 
-        let limiter = Arc::new(Limiter::new(aimd));
+        let limiter = Limiter::new(aimd);
 
         let token = limiter.try_acquire().await.unwrap();
 
-        token.release(Some(Outcome::Success)).await;
+        token.set_outcome(Outcome::Success).await;
         assert_eq!(
             limiter.state().limit(),
             4,
@@ -214,15 +214,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_not_change_limit_when_no_outcome() {
+    async fn should_not_change_limit_when_no_outcome_set() {
         let aimd = Aimd::new_with_initial_limit(10)
             .decrease_factor(0.5)
             .increase_by(1);
 
-        let limiter = Arc::new(Limiter::new(aimd));
+        let limiter = Limiter::new(aimd);
 
         let token = limiter.try_acquire().await.unwrap();
-        token.release(None).await;
+        drop(token);
+
         assert_eq!(limiter.state().limit(), 10, "ignore");
     }
 }

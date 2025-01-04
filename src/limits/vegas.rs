@@ -230,7 +230,7 @@ impl Debug for Vegas {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc, time::Duration};
+    use std::{collections::VecDeque, time::Duration};
 
     use itertools::Itertools;
 
@@ -243,7 +243,7 @@ mod tests {
         static INIT_LIMIT: usize = 10;
         let vegas = Vegas::new_with_initial_limit(INIT_LIMIT);
 
-        let limiter = Arc::new(Limiter::new(vegas));
+        let limiter = Limiter::new(vegas);
 
         /*
          * Warm up
@@ -258,7 +258,7 @@ mod tests {
         }
         for mut token in tokens {
             token.set_latency(Duration::from_millis(25));
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
         }
 
         /*
@@ -272,7 +272,7 @@ mod tests {
         }
         for mut token in tokens {
             token.set_latency(Duration::from_millis(25));
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
         }
         let higher_limit = limiter.state().limit();
         assert!(
@@ -291,7 +291,7 @@ mod tests {
             tokens.push(token);
         }
         for token in tokens {
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
         }
         assert!(
             limiter.state().limit() < higher_limit,
@@ -313,7 +313,7 @@ mod tests {
         .with_min_window(Duration::ZERO)
         .with_max_window(Duration::ZERO);
 
-        let limiter = Arc::new(Limiter::new(vegas));
+        let limiter = Limiter::new(vegas);
 
         let mut next_tokens = VecDeque::with_capacity(9);
 
@@ -330,7 +330,7 @@ mod tests {
         let release_tokens = next_tokens.drain(0..).collect_vec();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(25));
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
 
             let token = limiter.try_acquire().await.unwrap();
             next_tokens.push_back(token);
@@ -342,7 +342,7 @@ mod tests {
         let release_tokens = next_tokens.drain(0..).collect_vec();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(25));
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
 
             let token = limiter.try_acquire().await.unwrap();
             next_tokens.push_back(token);
@@ -361,7 +361,7 @@ mod tests {
         let release_tokens = next_tokens.drain(0..).collect_vec();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(1000));
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
 
             let token = limiter.try_acquire().await.unwrap();
             next_tokens.push_back(token);

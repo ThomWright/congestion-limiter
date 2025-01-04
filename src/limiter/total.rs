@@ -110,65 +110,57 @@ where
         }
     }
 
-    pub(crate) async fn update_limit(
-        &self,
-        outcome: Option<Outcome>,
-        latency: Duration,
-    ) -> CapacityUnit {
-        if let Some(outcome) = outcome {
-            let sample = self.new_sample(latency, outcome);
+    pub(crate) async fn update_limit(&self, outcome: Outcome, latency: Duration) -> CapacityUnit {
+        let sample = self.new_sample(latency, outcome);
 
-            let new_limit = self.limit_algo.update(sample).await;
+        let new_limit = self.limit_algo.update(sample).await;
 
-            let old_limit = self.limit.swap(new_limit, atomic::Ordering::SeqCst);
+        let old_limit = self.limit.swap(new_limit, atomic::Ordering::SeqCst);
 
-            match new_limit.cmp(&old_limit) {
-                cmp::Ordering::Greater => {
-                    self.semaphore.add_permits(new_limit - old_limit);
+        match new_limit.cmp(&old_limit) {
+            cmp::Ordering::Greater => {
+                self.semaphore.add_permits(new_limit - old_limit);
 
-                    #[cfg(test)]
-                    if let Some(n) = &self.notifier {
-                        n.notify_one();
-                    }
-                }
-                cmp::Ordering::Less => {
-                    let semaphore = self.semaphore.clone();
-                    #[cfg(test)]
-                    let notifier = self.notifier.clone();
-
-                    tokio::spawn(async move {
-                        // If there aren't enough permits available then this will wait until enough
-                        // become available. This could take a while, so we do this in the background.
-                        let permits = semaphore
-                            .acquire_many(
-                                u32::value_from(old_limit - new_limit)
-                                    .expect("change in limit shouldn't be > u32::MAX"),
-                            )
-                            .await
-                            .expect("we own the semaphore, we shouldn't have closed it");
-
-                        // Acquiring some permits and throwing them away reduces the available limit.
-                        permits.forget();
-
-                        #[cfg(test)]
-                        if let Some(n) = notifier {
-                            n.notify_one();
-                        }
-                    });
-                }
-                _ =>
-                {
-                    #[cfg(test)]
-                    if let Some(n) = &self.notifier {
-                        n.notify_one();
-                    }
+                #[cfg(test)]
+                if let Some(n) = &self.notifier {
+                    n.notify_one();
                 }
             }
+            cmp::Ordering::Less => {
+                let semaphore = self.semaphore.clone();
+                #[cfg(test)]
+                let notifier = self.notifier.clone();
 
-            new_limit
-        } else {
-            self.limit_algo.limit()
+                tokio::spawn(async move {
+                    // If there aren't enough permits available then this will wait until enough
+                    // become available. This could take a while, so we do this in the background.
+                    let permits = semaphore
+                        .acquire_many(
+                            u32::value_from(old_limit - new_limit)
+                                .expect("change in limit shouldn't be > u32::MAX"),
+                        )
+                        .await
+                        .expect("we own the semaphore, we shouldn't have closed it");
+
+                    // Acquiring some permits and throwing them away reduces the available limit.
+                    permits.forget();
+
+                    #[cfg(test)]
+                    if let Some(n) = notifier {
+                        n.notify_one();
+                    }
+                });
+            }
+            _ =>
+            {
+                #[cfg(test)]
+                if let Some(n) = &self.notifier {
+                    n.notify_one();
+                }
+            }
         }
+
+        new_limit
     }
 
     pub(crate) fn release(&self, permit: OwnedSemaphorePermit) {
@@ -221,7 +213,7 @@ mod tests {
         mock_algo.set_limit(20);
 
         limiter
-            .update_limit(Some(Outcome::Success), Duration::from_secs(1))
+            .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit);
 
@@ -247,7 +239,7 @@ mod tests {
         mock_algo.set_limit(20);
 
         limiter
-            .update_limit(Some(Outcome::Success), Duration::from_secs(1))
+            .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit);
 
@@ -270,7 +262,7 @@ mod tests {
         mock_algo.set_limit(5);
 
         limiter
-            .update_limit(Some(Outcome::Success), Duration::from_secs(1))
+            .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit);
 
@@ -296,7 +288,7 @@ mod tests {
         mock_algo.set_limit(1);
 
         limiter
-            .update_limit(Some(Outcome::Success), Duration::from_secs(1))
+            .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit1);
 
@@ -308,7 +300,7 @@ mod tests {
         assert_eq!(limiter.available(), 0, "available");
 
         limiter
-            .update_limit(Some(Outcome::Success), Duration::from_secs(1))
+            .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit2);
 
@@ -320,7 +312,7 @@ mod tests {
         assert_eq!(limiter.available(), 0, "available");
 
         limiter
-            .update_limit(Some(Outcome::Success), Duration::from_secs(1))
+            .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit3);
 

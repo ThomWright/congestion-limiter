@@ -31,8 +31,10 @@ impl Token {
         }
     }
 
-    /// Recalculate capacity and release this token back to the pool.
-    pub async fn release(self, outcome: Option<Outcome>) -> CapacityUnit {
+    /// Set the outcome for this job.
+    ///
+    /// Will recalculate capacity and release this token back to the pool.
+    pub async fn set_outcome(self, outcome: Outcome) -> CapacityUnit {
         self.releaser.update_limit(outcome, self.latency()).await
     }
 

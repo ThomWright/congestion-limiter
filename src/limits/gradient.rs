@@ -158,7 +158,7 @@ impl LimitAlgorithm for Gradient {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use crate::limiter::{Limiter, Outcome};
 
@@ -169,7 +169,7 @@ mod tests {
         static INIT_LIMIT: usize = 10;
         let gradient = Gradient::new_with_initial_limit(INIT_LIMIT);
 
-        let limiter = Arc::new(Limiter::new(gradient));
+        let limiter = Limiter::new(gradient);
 
         /*
          * Concurrency = 10
@@ -182,7 +182,7 @@ mod tests {
         }
         for mut token in tokens {
             token.set_latency(Duration::from_millis(25));
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
         }
         let higher_limit = limiter.state().limit();
         assert!(
@@ -201,7 +201,7 @@ mod tests {
             tokens.push(token);
         }
         for token in tokens {
-            token.release(Some(Outcome::Success)).await;
+            token.set_outcome(Outcome::Success).await;
         }
         assert!(
             limiter.state().limit() < higher_limit,

@@ -19,10 +19,10 @@ pub struct RejectionDelay<T> {
 
 impl<T> RejectionDelay<T> {
     #[allow(missing_docs)]
-    pub fn new(delay: Duration, limiter: Limiter<T>) -> Self {
+    pub fn new(delay: Duration, limiter: Arc<Limiter<T>>) -> Self {
         Self {
             delay,
-            inner: Arc::new(limiter),
+            inner: limiter,
         }
     }
 }

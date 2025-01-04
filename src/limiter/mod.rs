@@ -68,7 +68,7 @@ pub(crate) trait Releaser: Debug {
     ///
     /// Returns the new limit.
     /// TODO: do we need to return the new limit?
-    async fn update_limit(&self, outcome: Option<Outcome>, latency: Duration) -> CapacityUnit;
+    async fn update_limit(&self, outcome: Outcome, latency: Duration) -> CapacityUnit;
 
     fn release(&self, permit: OwnedSemaphorePermit);
 }
@@ -78,10 +78,20 @@ where
     T: LimitAlgorithm + 'static,
 {
     /// Create a limiter with a given limit control algorithm.
-    pub fn new(limit_algo: T) -> Self {
-        Self {
+    pub fn new(limit_algo: T) -> Arc<Self> {
+        Arc::new(Self {
             total_limiter: TotalLimiter::new(limit_algo),
-        }
+        })
+    }
+
+    /// In some cases [Token]s are acquired asynchronously when updating the limit.
+    #[cfg(test)]
+    pub fn new_with_release_notifier(limit_algo: T, n: Arc<tokio::sync::Notify>) -> Arc<Self> {
+        let mut limiter = TotalLimiter::new(limit_algo);
+        limiter.with_release_notifier(n);
+        Arc::new(Self {
+            total_limiter: limiter,
+        })
     }
 
     /// The current state of the limiter.
@@ -116,18 +126,11 @@ where
     fn mint_token(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> Token {
         Token::new(permit, Arc::clone(self))
     }
-
-    /// In some cases [Token]s are acquired asynchronously when updating the limit.
-    #[cfg(test)]
-    pub fn with_release_notifier(mut self, n: Arc<tokio::sync::Notify>) -> Self {
-        self.total_limiter.with_release_notifier(n);
-        self
-    }
 }
 
 #[async_trait::async_trait]
 impl<T: LimitAlgorithm + Debug + Sync> Releaser for Limiter<T> {
-    async fn update_limit(&self, outcome: Option<Outcome>, latency: Duration) -> CapacityUnit {
+    async fn update_limit(&self, outcome: Outcome, latency: Duration) -> CapacityUnit {
         self.total_limiter.update_limit(outcome, latency).await
     }
 
@@ -175,14 +178,14 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = Arc::new(Limiter::new(Arc::clone(&mock_algo)));
+        let limiter = Limiter::new(Arc::clone(&mock_algo));
 
         let mut token = limiter.try_acquire().await.unwrap();
 
         assert_eq!(limiter.state().in_flight, 1);
 
         token.set_latency(Duration::from_secs(1));
-        token.release(Some(Outcome::Success)).await;
+        token.set_outcome(Outcome::Success).await;
 
         assert_eq!(limiter.state().in_flight, 0);
         assert_eq!(limiter.state().limit, 10);
@@ -199,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_token() {
-        let limiter = Arc::new(Limiter::new(Fixed::new(10)));
+        let limiter = Limiter::new(Fixed::new(10));
 
         let token = limiter.try_acquire().await.unwrap();
 

@@ -72,12 +72,12 @@ use congestion_limiter::{limits::Aimd, limiter::{Limiter, Outcome}};
 
 // A limiter shared between request handler invocations.
 // This controls the concurrency of incoming requests.
-let limiter = Arc::new(Limiter::new(
+let limiter = Limiter::new(
     Aimd::new_with_initial_limit(10)
         .with_max_limit(20)
         .decrease_factor(0.9)
         .increase_by(1),
-));
+);
 
 // A request handler
 tokio_test::block_on(async move {
@@ -89,7 +89,7 @@ tokio_test::block_on(async move {
     // Do some work...
 
     // On request finish
-    token.release(Some(Outcome::Success)).await;
+    token.set_outcome(Outcome::Success).await;
 });
 ```
 

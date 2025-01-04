@@ -16,7 +16,7 @@ use crate::{
     limits::LimitAlgorithm,
 };
 
-use super::{AtomicCapacityUnit, CapacityUnit, Releaser, TotalLimiter};
+use super::{AtomicCapacityUnit, CapacityUnit, LimiterState, Releaser, TotalLimiter};
 
 type StateIndex = usize;
 
@@ -55,21 +55,26 @@ where
     /// partitions of 25%, 25% and 50% of the total limit, respectively.
     ///
     /// `weights` must not be empty.
-    pub fn new(limit_algo: T, weights: Vec<f64>) -> Vec<Self> {
+    pub fn new(limit_algo: T, weights: Vec<f64>) -> Vec<Arc<Self>> {
         let num_partitions = weights.len();
 
         let total_limiter = TotalLimiter::new(limit_algo);
         let scheduler = Scheduler::new(total_limiter, weights);
 
         let mut partitions = Vec::with_capacity(num_partitions);
-        for i in 0..partitions.len() {
-            partitions.push(Self {
+        for i in 0..num_partitions {
+            partitions.push(Arc::new(Self {
                 state_index: i,
                 scheduler: scheduler.clone(),
-            });
+            }));
         }
 
         partitions
+    }
+
+    /// The current state of the limiter.
+    pub fn state(&self) -> LimiterState {
+        self.scheduler.state(self.state_index)
     }
 
     /// Try to immediately acquire a concurrency [Token].
@@ -131,6 +136,14 @@ where
         })
     }
 
+    fn state(&self, index: usize) -> LimiterState {
+        let partition_state = self
+            .partition_states
+            .get(index)
+            .expect("partition state index should not be out of bounds");
+        partition_state.state(self.total_limiter.limit())
+    }
+
     async fn try_acquire(self: &Arc<Self>, index: usize) -> Option<OwnedSemaphorePermit> {
         let state = &self.partition_states[index];
 
@@ -182,7 +195,7 @@ where
 
     async fn update_limit(
         &self,
-        outcome: Option<Outcome>,
+        outcome: Outcome,
         latency: Duration,
         _index: usize,
     ) -> CapacityUnit {
@@ -219,15 +232,15 @@ where
 
     /// Total spare capacity which can be used by any partition.
     fn spare_capacity(&self, total_limit: CapacityUnit) -> CapacityUnit {
-        self.partition_states
-            .iter()
-            .fold(0, |total, partition| total + partition.spare(total_limit))
+        self.partition_states.iter().fold(0, |total, partition| {
+            total + partition.spare_capacity(total_limit)
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
-    async fn update_limit(&self, outcome: Option<Outcome>, latency: Duration) -> CapacityUnit {
+    async fn update_limit(&self, outcome: Outcome, latency: Duration) -> CapacityUnit {
         self.scheduler
             .update_limit(outcome, latency, self.state_index)
             .await
@@ -240,6 +253,16 @@ impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
 
 impl PartitionState {
     const BUFFER_FRACTION: f64 = 0.1;
+
+    fn state(&self, total_limit: CapacityUnit) -> LimiterState {
+        let limit = self.limit(total_limit);
+        let in_flight = self.in_flight();
+        LimiterState {
+            limit,
+            in_flight,
+            available: limit.saturating_sub(in_flight),
+        }
+    }
 
     fn limit(&self, total_limit: CapacityUnit) -> CapacityUnit {
         fractional_limit(total_limit, self.fraction)
@@ -258,7 +281,7 @@ impl PartitionState {
     }
 
     /// Spare capacity which can be used by other partitions.
-    fn spare(&self, total_limit: CapacityUnit) -> CapacityUnit {
+    fn spare_capacity(&self, total_limit: CapacityUnit) -> CapacityUnit {
         let partition_limit = self.limit(total_limit);
         let buffer = (partition_limit as f64 * Self::BUFFER_FRACTION)
             .ceil()
@@ -279,9 +302,42 @@ fn fractional_limit(limit: CapacityUnit, fraction: f64) -> CapacityUnit {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn it_works() {
-        // TODO: write some tests
+    use std::sync::Arc;
 
+    use crate::{
+        limiter::{Outcome, PartitionedLimiter},
+        limits::mock::MockLimitAlgorithm,
+    };
+
+    #[tokio::test]
+    async fn it_works() {
+        let mock_algo = Arc::new(MockLimitAlgorithm::default());
+        mock_algo.set_limit(10);
+
+        let partitions = PartitionedLimiter::new(Arc::clone(&mock_algo), vec![0.5, 0.5]);
+
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0].state().limit(), 5);
+        assert_eq!(partitions[1].state().limit(), 5);
+
+        let token0 = partitions[0].try_acquire().await.unwrap();
+        let token1 = partitions[1].try_acquire().await.unwrap();
+
+        assert_eq!(partitions[0].state().available(), 4);
+        assert_eq!(partitions[1].state().available(), 4);
+        assert_eq!(partitions[0].state().in_flight(), 1);
+        assert_eq!(partitions[1].state().in_flight(), 1);
+
+        token0.set_outcome(Outcome::Success).await;
+        drop(token1);
+
+        assert_eq!(partitions[0].state().available(), 5);
+        assert_eq!(partitions[1].state().available(), 5);
+        assert_eq!(partitions[0].state().in_flight(), 0);
+        assert_eq!(partitions[1].state().in_flight(), 0);
+
+        // Dropping a token won't contribute a sample to the limiter algorithm,
+        // only setting an outcome will.
+        assert_eq!(mock_algo.samples().await.len(), 1);
     }
 }
