@@ -7,10 +7,11 @@ use super::{CapacityUnit, Outcome, Releaser};
 /// A concurrency token, required to run a job.
 ///
 /// Release the token back to the [Limiter](crate::limiter::Limiter) after the job is complete.
+#[must_use = "Call `limiter.set_outcome()` with this token once done."]
 #[derive(Debug)]
 pub struct Token {
     permit: Option<OwnedSemaphorePermit>,
-    releaser: Arc<dyn Releaser>,
+    releaser: Arc<dyn Releaser + Sync + Send>,
 
     start: Instant,
     #[cfg(test)]
@@ -20,7 +21,7 @@ pub struct Token {
 impl Token {
     pub(crate) fn new(
         permit: OwnedSemaphorePermit,
-        releaser: Arc<impl Releaser + 'static>,
+        releaser: Arc<impl Releaser + Sync + Send + 'static>,
     ) -> Self {
         Self {
             permit: Some(permit),

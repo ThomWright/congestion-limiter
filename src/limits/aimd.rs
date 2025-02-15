@@ -170,7 +170,7 @@ mod tests {
 
         let limiter = Limiter::new_with_release_notifier(aimd, release_notifier.clone());
 
-        let token = limiter.try_acquire().await.unwrap();
+        let token = limiter.try_acquire().unwrap();
         token.set_outcome(Outcome::Overload).await;
         release_notifier.notified().await;
         assert_eq!(limiter.state().limit(), 5, "overload: decrease");
@@ -185,9 +185,9 @@ mod tests {
 
         let limiter = Limiter::new(aimd);
 
-        let token = limiter.try_acquire().await.unwrap();
-        let _token = limiter.try_acquire().await.unwrap();
-        let _token = limiter.try_acquire().await.unwrap();
+        let token = limiter.try_acquire().unwrap();
+        let _token = limiter.try_acquire().unwrap();
+        let _token = limiter.try_acquire().unwrap();
 
         token.set_outcome(Outcome::Success).await;
 
@@ -203,7 +203,7 @@ mod tests {
 
         let limiter = Limiter::new(aimd);
 
-        let token = limiter.try_acquire().await.unwrap();
+        let token = limiter.try_acquire().unwrap();
 
         token.set_outcome(Outcome::Success).await;
         assert_eq!(
@@ -221,7 +221,7 @@ mod tests {
 
         let limiter = Limiter::new(aimd);
 
-        let token = limiter.try_acquire().await.unwrap();
+        let token = limiter.try_acquire().unwrap();
         drop(token);
 
         assert_eq!(limiter.state().limit(), 10, "ignore");

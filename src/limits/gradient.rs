@@ -177,7 +177,7 @@ mod tests {
          */
         let mut tokens = Vec::with_capacity(10);
         for _ in 0..10 {
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             tokens.push(token);
         }
         for mut token in tokens {
@@ -196,7 +196,7 @@ mod tests {
          */
         let mut tokens = Vec::with_capacity(10);
         for _ in 0..10 {
-            let mut token = limiter.try_acquire().await.unwrap();
+            let mut token = limiter.try_acquire().unwrap();
             token.set_latency(Duration::from_millis(250));
             tokens.push(token);
         }

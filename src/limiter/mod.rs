@@ -21,6 +21,7 @@ mod token;
 mod total;
 
 type CapacityUnit = usize;
+type CapacityUnitNeg = isize;
 type AtomicCapacityUnit = AtomicUsize;
 
 /// Limits the number of concurrent jobs.
@@ -75,7 +76,7 @@ pub(crate) trait Releaser: Debug {
 
 impl<T> Limiter<T>
 where
-    T: LimitAlgorithm + 'static,
+    T: LimitAlgorithm + Send + 'static,
 {
     /// Create a limiter with a given limit control algorithm.
     pub fn new(limit_algo: T) -> Arc<Self> {
@@ -106,10 +107,9 @@ where
     /// Try to immediately acquire a concurrency [Token].
     ///
     /// Returns `None` if there are none available.
-    pub async fn try_acquire(self: &Arc<Self>) -> Option<Token> {
+    pub fn try_acquire(self: &Arc<Self>) -> Option<Token> {
         self.total_limiter
             .try_acquire()
-            .await
             .map(|permit| self.mint_token(permit))
     }
 
@@ -180,7 +180,7 @@ mod tests {
 
         let limiter = Limiter::new(Arc::clone(&mock_algo));
 
-        let mut token = limiter.try_acquire().await.unwrap();
+        let mut token = limiter.try_acquire().unwrap();
 
         assert_eq!(limiter.state().in_flight, 1);
 
@@ -204,7 +204,7 @@ mod tests {
     async fn dropping_token() {
         let limiter = Limiter::new(Fixed::new(10));
 
-        let token = limiter.try_acquire().await.unwrap();
+        let token = limiter.try_acquire().unwrap();
 
         assert_eq!(limiter.state().in_flight, 1);
 

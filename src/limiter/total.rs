@@ -82,7 +82,7 @@ where
         self.in_flight.fetch_sub(1, atomic::Ordering::SeqCst) - 1
     }
 
-    pub(crate) async fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+    pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         match Arc::clone(&self.semaphore).try_acquire_owned() {
             Ok(permit) => {
                 self.inc_in_flight();
@@ -188,7 +188,7 @@ mod tests {
 
         let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
 
-        let permit = limiter.try_acquire().await.expect("enough capacity");
+        let permit = limiter.try_acquire().expect("enough capacity");
 
         assert_eq!(limiter.limit(), 10, "limit");
         assert_eq!(limiter.in_flight(), 1, "in flight");
@@ -208,7 +208,7 @@ mod tests {
 
         let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
 
-        let permit = limiter.try_acquire().await.expect("enough capacity");
+        let permit = limiter.try_acquire().expect("enough capacity");
 
         mock_algo.set_limit(20);
 
@@ -234,7 +234,7 @@ mod tests {
 
         let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
 
-        let permit = limiter.try_acquire().await.expect("enough capacity");
+        let permit = limiter.try_acquire().expect("enough capacity");
 
         mock_algo.set_limit(20);
 
@@ -257,7 +257,7 @@ mod tests {
 
         let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
 
-        let permit = limiter.try_acquire().await.expect("enough capacity");
+        let permit = limiter.try_acquire().expect("enough capacity");
 
         mock_algo.set_limit(5);
 
@@ -281,9 +281,9 @@ mod tests {
 
         let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
 
-        let permit1 = limiter.try_acquire().await.expect("enough capacity");
-        let permit2 = limiter.try_acquire().await.expect("enough capacity");
-        let permit3 = limiter.try_acquire().await.expect("enough capacity");
+        let permit1 = limiter.try_acquire().expect("enough capacity");
+        let permit2 = limiter.try_acquire().expect("enough capacity");
+        let permit3 = limiter.try_acquire().expect("enough capacity");
 
         mock_algo.set_limit(1);
 

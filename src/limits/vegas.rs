@@ -253,7 +253,7 @@ mod tests {
          */
         let mut tokens = Vec::with_capacity(5);
         for _ in 0..5 {
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             tokens.push(token);
         }
         for mut token in tokens {
@@ -267,7 +267,7 @@ mod tests {
          */
         let mut tokens = Vec::with_capacity(9);
         for _ in 0..9 {
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             tokens.push(token);
         }
         for mut token in tokens {
@@ -286,7 +286,7 @@ mod tests {
          */
         let mut tokens = Vec::with_capacity(10);
         for _ in 0..10 {
-            let mut token = limiter.try_acquire().await.unwrap();
+            let mut token = limiter.try_acquire().unwrap();
             token.set_latency(Duration::from_millis(250));
             tokens.push(token);
         }
@@ -323,7 +323,7 @@ mod tests {
          * Steady latency, keeping concurrency high
          */
         for _ in 0..9 {
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             next_tokens.push_back(token);
         }
 
@@ -332,7 +332,7 @@ mod tests {
             token.set_latency(Duration::from_millis(25));
             token.set_outcome(Outcome::Success).await;
 
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             next_tokens.push_back(token);
         }
 
@@ -344,7 +344,7 @@ mod tests {
             token.set_latency(Duration::from_millis(25));
             token.set_outcome(Outcome::Success).await;
 
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             next_tokens.push_back(token);
         }
 
@@ -363,7 +363,7 @@ mod tests {
             token.set_latency(Duration::from_millis(1000));
             token.set_outcome(Outcome::Success).await;
 
-            let token = limiter.try_acquire().await.unwrap();
+            let token = limiter.try_acquire().unwrap();
             next_tokens.push_back(token);
         }
 

@@ -186,7 +186,6 @@ impl Client {
         match limiter {
             Some(limiter) => limiter
                 .try_acquire()
-                .await
                 .map(|token| {
                     Some(LimiterToken {
                         token,
@@ -241,7 +240,6 @@ impl Server {
         match limiter {
             Some(limiter) => limiter
                 .try_acquire()
-                .await
                 .map(|token| LimiterToken {
                     token,
                     limit_state: limiter.state(),

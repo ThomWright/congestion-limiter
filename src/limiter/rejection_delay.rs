@@ -27,12 +27,12 @@ impl<T> RejectionDelay<T> {
     }
 }
 
-impl<T: LimitAlgorithm + 'static> RejectionDelay<T> {
+impl<T: LimitAlgorithm + Send + 'static> RejectionDelay<T> {
     /// Try to immediately acquire a concurrency [Token].
     ///
     /// Returns `None` after a delay if there are none available.
     pub async fn try_acquire(&self) -> Option<Token> {
-        let token = self.inner.try_acquire().await;
+        let token = self.inner.try_acquire();
 
         if token.is_none() {
             tokio::time::sleep(self.delay).await;
