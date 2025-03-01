@@ -1,13 +1,13 @@
 use std::{
     collections::VecDeque,
     fmt::Debug,
-    sync::{atomic, Arc},
+    sync::{atomic, Arc, Mutex},
     time::Duration,
 };
 
 use conv::{ConvAsUtil, ConvUtil};
 use tokio::{
-    sync::{oneshot, Mutex, OwnedSemaphorePermit},
+    sync::{oneshot, OwnedSemaphorePermit},
     time::{timeout, Instant},
 };
 
@@ -43,6 +43,8 @@ struct PartitionState {
     /// Normalised, sum of fractions = 1.
     fraction: f64,
     in_flight: AtomicCapacityUnit,
+
+    // TODO: remove from queue when dropped/cancelled
     job_queue: Mutex<VecDeque<(Instant, oneshot::Sender<OwnedSemaphorePermit>)>>,
 }
 
@@ -176,58 +178,65 @@ where
             // First we try without the lock, then if we don't succeed we lock the queue and try
             // again. This is OK because there should never be a state where a job is in the
             // queue whilst there are available permits.
-            let mut lock = None;
-            let mut locked_queue = loop {
-                let total_limit = self.total_limiter.limit();
+            let rx = {
+                let mut lock = None;
+                let mut locked_queue = loop {
+                    let total_limit = self.total_limiter.limit();
 
-                // Cases:
-                // 1. Partition: available, total: available -> acquire
-                // 2. Partition: available, total: full -> queue
-                //    (another partition has borrowed)
-                // 3. Partition: full, total: spare -> acquire
-                // 4. Partition: full, total: no spare -> queue
+                    // Cases:
+                    // 1. Partition: available, total: available -> acquire
+                    // 2. Partition: available, total: full -> queue
+                    //    (another partition has borrowed)
+                    // 3. Partition: full, total: spare -> acquire
+                    // 4. Partition: full, total: no spare -> queue
 
-                // First, check if we might have capacity.
-                if partition.has_capacity_available(total_limit)
-                    || self.has_spare_capacity(total_limit)
-                {
-                    // Either this partition has capacity, or there's some spare capacity we can
-                    // borrow.
+                    // First, check if we might have capacity.
+                    if partition.has_capacity_available(total_limit)
+                        || self.has_spare_capacity(total_limit)
+                    {
+                        // Either this partition has capacity, or there's some spare capacity we can
+                        // borrow.
 
-                    // Let's see if the there's a permit available (this might change by
-                    // time we try to acquire it).
-                    let permit = self.total_limiter.try_acquire();
+                        // Let's see if the there's a permit available (this might change by
+                        // time we try to acquire it).
+                        let permit = self.total_limiter.try_acquire();
 
-                    if permit.is_some() {
-                        return permit;
-                    }
-                }
-
-                // If not, then we might have to queue this job.
-                break match lock {
-                    None => {
-                        // Any jobs in this partition will lock the queue before returning their
-                        // permit, so locking the queue here prevents any new permits being added
-                        // underneath us.
-
-                        // We might miss available spare capacity *from other partitions*, but
-                        // that's OK.
-
-                        // So lock the queue and try again.
-                        lock = Some(partition.job_queue.lock().await);
-                        continue;
+                        if permit.is_some() {
+                            return permit;
+                        }
                     }
 
-                    // We locked the queue and there is still no available capacity
-                    Some(lock) => lock,
+                    // If not, then we might have to queue this job.
+                    break match lock {
+                        None => {
+                            // Any jobs in this partition will lock the queue before returning their
+                            // permit, so locking the queue here prevents any new permits being added
+                            // underneath us.
+
+                            // We might miss available spare capacity *from other partitions*, but
+                            // that's OK.
+
+                            // So lock the queue and try again.
+                            lock = Some(match partition.job_queue.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            });
+                            continue;
+                        }
+
+                        // We locked the queue and there is still no available capacity
+                        Some(lock) => lock,
+                    };
                 };
+
+                // No available capacity. We'll have to wait.
+
+                let (tx, rx) = oneshot::channel();
+                locked_queue.push_back((Instant::now(), tx));
+                drop(locked_queue);
+
+                rx
             };
-
-            // No available capacity. We'll have to wait.
-
-            let (tx, rx) = oneshot::channel();
-            locked_queue.push_back((Instant::now(), tx));
-            drop(locked_queue);
 
             // Wait for a permit to be recycled.
             let permit = rx.await;
@@ -274,23 +283,26 @@ where
         let scheduler = Arc::clone(self);
         tokio::spawn(async move {
             let mut highest_priority = 0.0;
-            let mut unlocked_queue = None;
+            let mut locked_queue = None;
 
             // Iterate through all partitions to find the job with the highest priority.
             // The item at the front of each queue has the highest priority for that partition.
             // O(n) where n is the number of partitions.
             for p in scheduler.partition_states.iter() {
-                let q = p.job_queue.lock().await;
+                let q = match p.job_queue.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 if let Some((instant, _tx)) = q.front() {
                     let job_priority = priority(p.fraction, instant.elapsed());
                     if job_priority > highest_priority {
                         highest_priority = job_priority;
-                        unlocked_queue = Some(q);
+                        locked_queue = Some(q);
                     }
                 }
             }
 
-            if let Some(mut queue) = unlocked_queue {
+            if let Some(mut queue) = locked_queue {
                 let (_, tx) = queue.pop_front().unwrap();
                 let _ = tx.send(permit);
             } else {
@@ -397,9 +409,10 @@ fn fractional_limit(limit: CapacityUnit, fraction: f64) -> CapacityUnit {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
-
-    use tokio::sync::Mutex;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use crate::{
         limiter::{Outcome, PartitionedLimiter, Token},
@@ -509,14 +522,14 @@ mod tests {
             let t = Arc::clone(&t);
             async move {
                 let token = partitions[0].acquire_timeout(Duration::MAX).await;
-                t.lock().await.replace(token.unwrap());
+                t.lock().unwrap().replace(token.unwrap());
             }
         });
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert!(
-            t.lock().await.is_none(),
+            t.lock().unwrap().is_none(),
             "should not have acquired token yet"
         );
 
@@ -526,7 +539,7 @@ mod tests {
         // Wait for acquiring to complete
         queueing_task.await.expect("task should not panic");
 
-        assert!(t.lock().await.is_some(), "should acquire the token");
+        assert!(t.lock().unwrap().is_some(), "should acquire the token");
     }
 
     // TODO: test fairness

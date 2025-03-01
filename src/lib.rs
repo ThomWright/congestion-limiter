@@ -11,3 +11,4 @@ pub mod aggregation;
 pub mod limiter;
 pub mod limits;
 mod moving_avg;
+mod semaphore;

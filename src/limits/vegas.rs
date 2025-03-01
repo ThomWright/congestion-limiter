@@ -1,12 +1,14 @@
 use std::{
     fmt::Debug,
     ops::RangeInclusive,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use crate::{limiter::Outcome, limits::defaults};
 
@@ -165,7 +167,10 @@ impl LimitAlgorithm for Vegas {
             return self.limit.load(Ordering::Acquire);
         }
 
-        let mut inner = self.inner.lock().await;
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
         if sample.latency < inner.base_latency {
             // Record a baseline "no load" latency and keep the limit.

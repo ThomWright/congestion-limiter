@@ -1,11 +1,13 @@
 use std::{
     ops::RangeInclusive,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 use async_trait::async_trait;
 use conv::ConvAsUtil;
-use tokio::sync::Mutex;
 
 use crate::{
     limits::{defaults, Sample},
@@ -107,7 +109,10 @@ impl LimitAlgorithm for Gradient {
             return self.limit.load(Ordering::Acquire);
         }
 
-        let mut inner = self.inner.lock().await;
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
         // Update long window
         let long = inner.long_window_latency.sample(sample.latency);

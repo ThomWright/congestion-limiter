@@ -41,10 +41,8 @@ pub struct Sample {
 pub(crate) mod mock {
     use std::sync::{
         atomic::{self, AtomicUsize},
-        Arc,
+        Arc, Mutex,
     };
-
-    use tokio::sync::Mutex;
 
     use super::{LimitAlgorithm, Sample};
 
@@ -60,7 +58,7 @@ pub(crate) mod mock {
         }
 
         pub async fn samples(self: &Arc<Self>) -> Vec<Sample> {
-            self.samples.lock().await.clone()
+            self.samples.lock().unwrap().clone()
         }
     }
 
@@ -71,7 +69,7 @@ pub(crate) mod mock {
         }
 
         async fn update(&self, sample: Sample) -> usize {
-            self.samples.lock().await.push(sample);
+            self.samples.lock().unwrap().push(sample);
             self.limit.load(atomic::Ordering::Acquire)
         }
     }
