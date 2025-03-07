@@ -11,7 +11,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     sync::{
-        atomic::{self, AtomicUsize},
+        atomic::{self, AtomicBool, AtomicUsize},
         Arc, Mutex,
     },
 };
@@ -38,12 +38,16 @@ use tokio::{sync::oneshot, time::Instant};
 pub struct Semaphore {
     available_permits: AtomicUsize,
     queue: Mutex<VecDeque<QueueEntry>>,
+    // The tokio implementation has a nice optimisation where the closed state is a bitmask over
+    // `available_permits` (a few bits are reserved for flags), so it can load the complete state
+    // atomically.
+    closed: AtomicBool,
 }
 
 #[derive(Debug)]
 struct QueueEntry {
     id: EntryId,
-    sender: oneshot::Sender<Permit>,
+    sender: oneshot::Sender<Result<Permit, AcquireError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,7 +72,7 @@ pub struct Options {
 
 struct Acquire {
     id: EntryId,
-    receiver: oneshot::Receiver<Permit>,
+    receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -89,12 +93,16 @@ impl Semaphore {
         Self {
             available_permits: AtomicUsize::new(options.max_permits),
             queue: Mutex::new(VecDeque::with_capacity(options.max_queue_size)),
+            closed: AtomicBool::new(false),
         }
     }
 
     pub fn try_acquire(self: Arc<Self>) -> Result<Permit, AcquireError> {
         let mut available_permits = self.available_permits.load(atomic::Ordering::Acquire);
         loop {
+            if self.closed.load(atomic::Ordering::Acquire) {
+                return Err(AcquireError::Closed);
+            }
             if available_permits == 0 {
                 return Err(AcquireError::NoPermits);
             }
@@ -120,9 +128,11 @@ impl Semaphore {
         self: Arc<Self>,
         timeout: std::time::Duration,
     ) -> Result<Permit, AcquireError> {
-        dbg!("acquire_timeout");
         let mut available_permits = self.available_permits.load(atomic::Ordering::Acquire);
         loop {
+            if self.closed.load(atomic::Ordering::Acquire) {
+                return Err(AcquireError::Closed);
+            }
             if available_permits == 0 {
                 let (receiver, id) = {
                     let mut queue = self.queue.lock().expect("lock should not be poisoned");
@@ -130,7 +140,6 @@ impl Semaphore {
                         return Err(AcquireError::QueueFull);
                     }
                     let (sender, receiver) = oneshot::channel();
-                    dbg!("push to queue");
 
                     let id = match queue.back() {
                         Some(entry) => entry.id.next(),
@@ -149,7 +158,10 @@ impl Semaphore {
                             semaphore: Some(Arc::clone(&self)),
                         });
                     }
-                    _ => {
+                    Ok(Err(e)) => {
+                        return Err(e);
+                    }
+                    Err(_elapsed) => {
                         return Err(AcquireError::Timeout);
                     }
                 }
@@ -177,9 +189,9 @@ impl Semaphore {
         if let Some(entry) = queue.pop_front() {
             drop(queue);
 
-            let _ = entry.sender.send(Permit {
+            let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
-            });
+            }));
         } else {
             self.available_permits
                 .fetch_add(1, atomic::Ordering::Release);
@@ -193,10 +205,29 @@ impl Semaphore {
             drop(queue);
         }
     }
+
+    fn close(&self) {
+        self.closed.store(true, atomic::Ordering::Release);
+
+        let mut queue = self.queue.lock().expect("lock should not be poisoned");
+        for entry in queue.drain(..) {
+            let _ = entry.sender.send(Err(AcquireError::Closed));
+        }
+    }
+}
+
+impl Drop for Semaphore {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl Acquire {
-    fn new(semaphore: Arc<Semaphore>, receiver: oneshot::Receiver<Permit>, id: EntryId) -> Self {
+    fn new(
+        semaphore: Arc<Semaphore>,
+        receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
+        id: EntryId,
+    ) -> Self {
         Self {
             id,
             receiver,
@@ -214,13 +245,18 @@ impl Future for Acquire {
     ) -> std::task::Poll<Self::Output> {
         std::pin::Pin::new(&mut self.as_mut().receiver)
             .poll(cx)
-            .map(|r| r.map_err(|_| AcquireError::Closed))
+            .map(|r| {
+                match r {
+                    Ok(Ok(permit)) => Ok(permit),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(AcquireError::Closed),
+                }
+            })
     }
 }
 
 impl Drop for Acquire {
     fn drop(&mut self) {
-        dbg!("drop acquire");
         self.semaphore.cancel(self.id);
     }
 }
@@ -353,5 +389,38 @@ mod tests {
         acquire_task2.abort();
         tokio::task::yield_now().await;
         assert_eq!(semaphore.queue.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_timeout_errors_when_semaphore_closed() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(1).max_queue_size(1).build(),
+        ));
+
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let acquire_task = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::from_secs(1)).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        semaphore.close();
+
+        let res = acquire_task.await.unwrap();
+        assert_matches!(res, Err(AcquireError::Closed));
+    }
+
+    #[tokio::test]
+    async fn acquire_errs_when_closed() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(1).max_queue_size(1).build(),
+        ));
+        semaphore.close();
+
+        let res = semaphore.clone().try_acquire();
+        assert_matches!(res, Err(AcquireError::Closed));
+
+        let res = semaphore.acquire_timeout(Duration::from_secs(1)).await;
+        assert_matches!(res, Err(AcquireError::Closed));
     }
 }
