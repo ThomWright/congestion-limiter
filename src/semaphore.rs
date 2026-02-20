@@ -38,6 +38,7 @@ use tokio::{sync::oneshot, time::Instant};
 pub struct Semaphore {
     available_permits: AtomicUsize,
     queue: Mutex<VecDeque<QueueEntry>>,
+    max_queue_size: usize,
     // The tokio implementation has a nice optimisation where the closed state is a bitmask over
     // `available_permits` (a few bits are reserved for flags), so it can load the complete state
     // atomically.
@@ -93,6 +94,7 @@ impl Semaphore {
         Self {
             available_permits: AtomicUsize::new(options.max_permits),
             queue: Mutex::new(VecDeque::with_capacity(options.max_queue_size)),
+            max_queue_size: options.max_queue_size,
             closed: AtomicBool::new(false),
         }
     }
@@ -136,7 +138,31 @@ impl Semaphore {
             if available_permits == 0 {
                 let (receiver, id) = {
                     let mut queue = self.queue.lock().expect("lock should not be poisoned");
-                    if queue.len() == queue.capacity() {
+
+                    // Re-check under the lock: a concurrent return_permit may have incremented
+                    // available_permits after our load but before we locked the queue. If so,
+                    // grab the permit directly without queuing.
+                    let mut current = self.available_permits.load(atomic::Ordering::Acquire);
+                    loop {
+                        if current == 0 {
+                            break;
+                        }
+                        match self.available_permits.compare_exchange(
+                            current,
+                            current - 1,
+                            atomic::Ordering::AcqRel,
+                            atomic::Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                return Ok(Permit {
+                                    semaphore: Some(Arc::clone(&self)),
+                                });
+                            }
+                            Err(v) => current = v,
+                        }
+                    }
+
+                    if queue.len() >= self.max_queue_size {
                         return Err(AcquireError::QueueFull);
                     }
                     let (sender, receiver) = oneshot::channel();
@@ -153,10 +179,8 @@ impl Semaphore {
 
                 let acquire = Acquire::new(Arc::clone(&self), receiver, id);
                 match tokio::time::timeout(timeout, acquire).await {
-                    Ok(Ok(_)) => {
-                        return Ok(Permit {
-                            semaphore: Some(Arc::clone(&self)),
-                        });
+                    Ok(Ok(permit)) => {
+                        return Ok(permit);
                     }
                     Ok(Err(e)) => {
                         return Err(e);
