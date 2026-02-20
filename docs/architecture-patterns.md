@@ -14,6 +14,18 @@ When multiple clients share a downstream service, their limiters compete for cap
 
 Client-side limiters typically assume that a load balancer distributes requests across multiple server instances. The limiter doesn't need to know about individual servers — it treats the downstream service as a single entity.
 
+## Push-based vs pull-based systems
+
+The discussion above assumes a push-based model: clients send requests and servers receive them. The server can't control the arrival rate — it can only reject or accept what arrives. Backpressure has to be *communicated back* to the sender, via rejections, timeouts, or explicit signals like HTTP 429.
+
+In a pull-based system — a message queue consumer, for example — the consumer fetches work when it's ready. Backpressure is inherent: if the consumer is busy, it simply doesn't pull the next message. The queue absorbs the difference, and no explicit signal is needed.
+
+Concurrency limiting still has a role in pull-based systems, in two ways:
+
+**Controlling the pull rate.** A consumer can use the concurrency limit to decide when to pull: if no tokens are available, don't fetch the next message. The limiter's rejection acts as a local backpressure signal, and the queue is the buffer. This is also where `RejectionDelay` is relevant — if the message broker has eager redelivery (e.g. RabbitMQ nacking a message causes immediate retry), the delay helps avoid a tight retry loop.
+
+**Limiting downstream calls.** Even in a pull-based system, the consumer typically makes push-based calls to downstream services (databases, APIs, other services) as part of processing each message. Client-side limiting on those outbound calls applies exactly as described above.
+
 ## Partitioning and QoS
 
 Not all traffic is equally important. A service might need to guarantee that user-facing requests get priority over batch jobs, even under load. Partitioning provides a form of quality of service (QoS): by reserving capacity for different traffic classes, you can ensure that high-priority work isn't starved by lower-priority work during contention.

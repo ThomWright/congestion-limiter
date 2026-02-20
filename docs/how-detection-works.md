@@ -39,5 +39,3 @@ These failure signals — which also serve as backpressure signals to upstream s
 Explicit signals are more reliable but require the downstream system to implement them. Implicit signals work without downstream cooperation but are more ambiguous — a timeout could be caused by overload, or by something unrelated like a firewall silently dropping packets. In practice, a combination often works best: explicit signals provide a clear backpressure mechanism, while implicit signals like rising latency provide earlier, more gradual detection.
 
 The [AIMD](../src/limit/aimd.rs) algorithm uses loss-based detection with additive increase and multiplicative decrease. [Vegas](../src/limit/vegas.rs) combines both loss and delay detection — it uses delay to make fine-grained adjustments and loss as a stronger signal for more aggressive reduction.
-
-<!-- TODO: explore push-based vs pull-based systems and how backpressure differs between them (e.g. HTTP request/response vs message queue consumption) -->
