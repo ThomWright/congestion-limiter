@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-use bon::Builder;
+use bon::{bon, Builder};
 use tokio::{sync::oneshot, time::Instant};
 
 // Design options:
@@ -65,12 +65,6 @@ pub struct Permit {
     semaphore: Option<Arc<Semaphore>>,
 }
 
-#[derive(Debug, Builder)]
-pub struct Options {
-    max_permits: usize,
-    max_queue_size: usize,
-}
-
 struct Acquire {
     id: EntryId,
     receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
@@ -89,12 +83,14 @@ pub enum AcquireError {
     Closed,
 }
 
+#[bon]
 impl Semaphore {
-    pub fn new(options: Options) -> Self {
+    #[builder]
+    pub fn new(max_permits: usize, max_queue_size: usize) -> Self {
         Self {
-            available_permits: AtomicUsize::new(options.max_permits),
-            queue: Mutex::new(VecDeque::with_capacity(options.max_queue_size)),
-            max_queue_size: options.max_queue_size,
+            available_permits: AtomicUsize::new(max_permits),
+            queue: Mutex::new(VecDeque::with_capacity(max_queue_size)),
+            max_queue_size,
             closed: AtomicBool::new(false),
         }
     }
@@ -364,9 +360,12 @@ mod tests {
 
     #[tokio::test]
     async fn try_acquire() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
         {
             let p1 = semaphore.clone().try_acquire();
             assert!(p1.is_ok());
@@ -380,9 +379,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
         let p1 = semaphore.clone().try_acquire().unwrap();
         let acquired = Arc::new(Mutex::new(false));
         let acquire_task = tokio::spawn({
@@ -404,9 +406,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_times_out() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
         // Acquire and hold the only permit
         let _p1 = semaphore.clone().try_acquire().unwrap();
         let acquire_task = tokio::spawn({
@@ -425,9 +430,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_removes_from_queue_when_dropped() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(2).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(2)
+                .build(),
+        );
 
         // Acquire and hold the only permit
         let _p1 = semaphore.clone().try_acquire().unwrap();
@@ -455,9 +463,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_errors_when_semaphore_closed() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
 
         let _p1 = semaphore.clone().try_acquire().unwrap();
         let acquire_task = tokio::spawn({
@@ -474,9 +485,12 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_errs_when_closed() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
         semaphore.close();
 
         let res = semaphore.clone().try_acquire();
@@ -490,9 +504,12 @@ mod tests {
     /// remain consistent (i.e. the permit is not double-returned).
     #[tokio::test(start_paused = true)]
     async fn queued_acquire_does_not_double_return_permit() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
 
         let p1 = semaphore.clone().try_acquire().unwrap();
 
@@ -517,9 +534,12 @@ mod tests {
     /// Regression test: queue full error is returned at exactly the configured limit.
     #[tokio::test]
     async fn queue_full_error() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
         let _p1 = semaphore.clone().try_acquire().unwrap();
 
         // First waiter fills the queue
@@ -538,9 +558,12 @@ mod tests {
     /// `add_permits` wakes exactly as many queued waiters as new permits added.
     #[tokio::test(start_paused = true)]
     async fn add_permits_wakes_waiters() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(3).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(3)
+                .build(),
+        );
 
         // Fill up all permits
         let _p1 = semaphore.clone().try_acquire().unwrap();
@@ -573,9 +596,12 @@ mod tests {
     /// `add_permits` with more permits than waiters puts the surplus into available_permits.
     #[tokio::test(start_paused = true)]
     async fn add_permits_surplus_goes_to_available() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(2).max_queue_size(1).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(2)
+                .max_queue_size(1)
+                .build(),
+        );
 
         // Hold both permits
         let _p1 = semaphore.clone().try_acquire().unwrap();
@@ -600,9 +626,12 @@ mod tests {
     /// Forgetting a permit permanently removes it from the pool.
     #[tokio::test]
     async fn forget_reduces_pool_size() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(3).max_queue_size(0).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(3)
+                .max_queue_size(0)
+                .build(),
+        );
 
         assert_eq!(semaphore.available_permits(), 3);
 
@@ -620,9 +649,12 @@ mod tests {
     /// `acquire_many` acquires exactly n permits.
     #[tokio::test]
     async fn acquire_many_acquires_n_permits() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(5).max_queue_size(0).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(5)
+                .max_queue_size(0)
+                .build(),
+        );
 
         let permits = semaphore.clone().acquire_many(3).await.unwrap();
         assert_eq!(permits.len(), 3);
@@ -635,9 +667,12 @@ mod tests {
     /// `acquire_many` blocks until all permits are available.
     #[tokio::test(start_paused = true)]
     async fn acquire_many_waits_for_permits() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(2).max_queue_size(3).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(2)
+                .max_queue_size(3)
+                .build(),
+        );
 
         // Hold both permits
         let p1 = semaphore.clone().try_acquire().unwrap();
@@ -670,9 +705,12 @@ mod tests {
     /// Waiters are served in FIFO order.
     #[tokio::test(start_paused = true)]
     async fn fifo_ordering() {
-        let semaphore = Arc::new(Semaphore::new(
-            Options::builder().max_permits(1).max_queue_size(3).build(),
-        ));
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(3)
+                .build(),
+        );
 
         let p1 = semaphore.clone().try_acquire().unwrap();
 
