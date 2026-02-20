@@ -83,11 +83,11 @@ The algorithms detect congestion or overload by observing two types of feedback:
 - **Loss-based** — react to job failures caused by overload. Feedback can be explicit (e.g. HTTP 429 or 503) or implicit (e.g. a timeout).
 - **Delay-based** — react to increases in latency, a sign of growing queues. Feedback is implicit.
 
-| Algorithm                          | Feedback       | Response             | [Fairness](https://en.wikipedia.org/wiki/Fairness_measure)                                       |
-|------------------------------------|----------------|----------------------|--------------------------------------------------------------------------------------------------|
-| [`Aimd`]         | Loss           | AIMD                 | Fair, but can out-compete delay-based algorithms                                                 |
-| [`Gradient`]     | Delay          | AIMD                 | TODO: ?                                                                                          |
-| [`Vegas`]        | Loss and delay | AIAD (AIMD for loss) | [Proportional](https://en.wikipedia.org/wiki/Proportional-fair_scheduling) until overload (loss) |
+| Algorithm    | Feedback       | Response             | [Fairness](https://en.wikipedia.org/wiki/Fairness_measure)                                       |
+|--------------|----------------|----------------------|--------------------------------------------------------------------------------------------------|
+| [`Aimd`]     | Loss           | AIMD                 | Fair, but can out-compete delay-based algorithms                                                 |
+| [`Gradient`] | Delay          | AIMD                 | TODO: ?                                                                                          |
+| [`Vegas`]    | Loss and delay | AIAD (AIMD for loss) | [Proportional](https://en.wikipedia.org/wiki/Proportional-fair_scheduling) until overload (loss) |
 
 See [how detection works][doc-detection] for more on delay-based vs loss-based detection.
 
