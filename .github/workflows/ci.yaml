@@ -22,19 +22,19 @@ jobs:
           # - win-gnu
         include:
           - build: pinned
-            os: ubuntu-22.04
-            rust: 1.81.0
+            os: ubuntu-24.04
+            rust: 1.85.0
           - build: pinned-win
             os: windows-2019
-            rust: 1.81.0
+            rust: 1.85.0
           - build: stable
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             rust: stable
           - build: beta
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             rust: beta
           - build: nightly
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             rust: nightly
           - build: macos
             os: macos-latest
@@ -61,7 +61,7 @@ jobs:
 
   rustfmt:
     name: rustfmt
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v3
@@ -81,7 +81,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       checks: write
     steps:
@@ -95,7 +95,7 @@ jobs:
   publish:
     name: publish
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: [clippy, test]
     steps:
       - uses: actions/checkout@v3
