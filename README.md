@@ -11,9 +11,9 @@ Dynamic concurrency limits for controlling backpressure, inspired by TCP congest
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
 [mit-url]: https://opensource.org/licenses/MIT
 [docs-badge]: https://img.shields.io/badge/docs-latest-blue.svg
-[docs-url]: https://docs.rs/congestion-limiter
+[docs-url]: https://docs.rs/congestion-limiter/latest/congestion_limiter/
 
-[Additional documentation](./docs/index.md)
+[Additional documentation][docs-dir]
 
 ## The problem
 
@@ -27,7 +27,7 @@ Think of it like a nightclub. Rate limiting is controlling how many people enter
 
 This matters in practice. When latency increases — because of expensive requests, reduced capacity, or a downstream slowdown — a rate limit still lets the same volume of traffic through, making overload worse. A concurrency limit automatically admits fewer requests, because existing ones are taking longer to complete.
 
-See [why concurrency limiting](./docs/why-concurrency-limiting.md) for a worked example and the full argument.
+See [why concurrency limiting][doc-why] for a worked example and the full argument.
 
 ## Why dynamic?
 
@@ -39,7 +39,7 @@ This library discovers the right limit automatically, by observing system behavi
 
 The library observes job latency and failure rates, and adjusts the concurrency limit using algorithms based on [TCP congestion control](https://en.wikipedia.org/wiki/TCP_congestion_control). When things are going well, the limit increases. When latency rises or failures are detected, the limit decreases. Beyond the limit, requests are rejected, providing backpressure to upstream systems.
 
-For an intuitive walkthrough, see the [supermarket analogy](./docs/supermarket-analogy.md). For technical detail on the detection mechanisms, see [how detection works](./docs/how-detection-works.md).
+For an intuitive walkthrough, see the [supermarket analogy][doc-supermarket]. For technical detail on the detection mechanisms, see [how detection works][doc-detection].
 
 ## Goals
 
@@ -85,19 +85,19 @@ The algorithms detect congestion or overload by observing two types of feedback:
 
 | Algorithm                          | Feedback       | Response             | [Fairness](https://en.wikipedia.org/wiki/Fairness_measure)                                       |
 |------------------------------------|----------------|----------------------|--------------------------------------------------------------------------------------------------|
-| [AIMD](src/limits/aimd.rs)         | Loss           | AIMD                 | Fair, but can out-compete delay-based algorithms                                                 |
-| [Gradient](src/limits/gradient.rs) | Delay          | AIMD                 | TODO: ?                                                                                          |
-| [Vegas](src/limits/vegas.rs)       | Loss and delay | AIAD (AIMD for loss) | [Proportional](https://en.wikipedia.org/wiki/Proportional-fair_scheduling) until overload (loss) |
+| [`Aimd`]         | Loss           | AIMD                 | Fair, but can out-compete delay-based algorithms                                                 |
+| [`Gradient`]     | Delay          | AIMD                 | TODO: ?                                                                                          |
+| [`Vegas`]        | Loss and delay | AIAD (AIMD for loss) | [Proportional](https://en.wikipedia.org/wiki/Proportional-fair_scheduling) until overload (loss) |
 
-See [how detection works](./docs/how-detection-works.md) for more on delay-based vs loss-based detection.
+See [how detection works][doc-detection] for more on delay-based vs loss-based detection.
 
 ### Example topology
 
 The example below shows two applications using limiters on the client (output) and on the server (input), using different algorithms for each.
 
-![Example topology](docs/assets/example-topology.png)
+![Example topology][topology-img]
 
-See [architecture patterns](./docs/architecture-patterns.md) for guidance on server-side vs client-side limiting.
+See [architecture patterns][doc-architecture] for guidance on server-side vs client-side limiting.
 
 ### Caveats
 
@@ -134,12 +134,28 @@ No! The congestion avoidance is based on TCP congestion control algorithms which
 - [Marc Brooker — Telling Stories About Little's Law](https://brooker.co.za/blog/2018/06/20/littles-law.html)
 - [Queuing theory: Definition, history & real-life applications & examples](https://queue-it.com/blog/queuing-theory/)
 
+<!-- Link definitions -->
+
+[docs-dir]: https://github.com/ThomWright/congestion-limiter/blob/main/docs/index.md
+[doc-why]: https://github.com/ThomWright/congestion-limiter/blob/main/docs/why-concurrency-limiting.md
+[doc-detection]: https://github.com/ThomWright/congestion-limiter/blob/main/docs/how-detection-works.md
+[doc-supermarket]: https://github.com/ThomWright/congestion-limiter/blob/main/docs/supermarket-analogy.md
+[doc-architecture]: https://github.com/ThomWright/congestion-limiter/blob/main/docs/architecture-patterns.md
+[topology-img]: https://raw.githubusercontent.com/ThomWright/congestion-limiter/main/docs/assets/example-topology.png
+
+[`Aimd`]: https://docs.rs/congestion-limiter/*/congestion_limiter/limits/struct.Aimd.html
+[`Gradient`]: https://docs.rs/congestion-limiter/*/congestion_limiter/limits/struct.Gradient.html
+[`Vegas`]: https://docs.rs/congestion-limiter/*/congestion_limiter/limits/struct.Vegas.html
+
 ## License
 
 Licensed under either of
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0, ([LICENSE-APACHE] or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT] or <http://opensource.org/licenses/MIT>)
+
+[LICENSE-APACHE]: https://github.com/ThomWright/congestion-limiter/blob/main/LICENSE-APACHE
+[LICENSE-MIT]: https://github.com/ThomWright/congestion-limiter/blob/main/LICENSE-MIT
 
 at your option.
 

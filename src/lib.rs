@@ -1,12 +1,6 @@
-//! Dynamic concurrency limits for controlling backpressure, inspired by TCP congestion control.
-
+#![doc = include_str!(concat!(env!("OUT_DIR"), "/README-rustdocified.md"))]
 #![deny(missing_docs)]
-
-#[cfg(doctest)]
-use doc_comment::doctest;
-#[cfg(doctest)]
-doctest!("../README.md");
-
+#[cfg_attr(doctest, doc = include_str!("../README.md"))]
 pub mod aggregation;
 pub mod limiter;
 pub mod limits;
