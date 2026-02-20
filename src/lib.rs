@@ -1,4 +1,4 @@
-//! Dynamic congestion-based concurrency limits for controlling backpressure.
+//! Dynamic concurrency limits for controlling backpressure, inspired by TCP congestion control.
 
 #![deny(missing_docs)]
 

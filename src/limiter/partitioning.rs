@@ -22,7 +22,7 @@ use super::{
 
 type StateIndex = usize;
 
-/// A partitioned [Limiter], using some fraction of the concurrency limit.
+/// A partitioned [Limiter](crate::limiter::Limiter), using some fraction of the concurrency limit.
 ///
 /// Capacity can be borrowed from other partitions if available.
 #[derive(Debug)]

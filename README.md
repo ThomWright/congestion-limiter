@@ -1,20 +1,45 @@
 # congestion-limiter
 
-Dynamic congestion-based concurrency limits for controlling backpressure.
+Dynamic concurrency limits for controlling backpressure, inspired by TCP congestion control.
 
-[Documentation](./docs/index.md)
+[![Crates.io][crates-badge]][crates-url]
+[![MIT licensed][mit-badge]][mit-url]
+[![Docs][docs-badge]][docs-url]
 
-## What is this?
+[crates-badge]: https://img.shields.io/crates/v/congestion-limiter.svg
+[crates-url]: https://crates.io/crates/congestion-limiter
+[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
+[mit-url]: https://opensource.org/licenses/MIT
+[docs-badge]: https://img.shields.io/badge/docs-latest-blue.svg
+[docs-url]: https://docs.rs/congestion-limiter
 
-A Rust library to dynamically control concurrency limits. Several algorithms are included, mostly based on TCP congestion control. These detect signs of congestion or overload by observing and reacting to either latency (delay) or load-based failures (loss), respectively. Beyond the limit, additional requests to perform work can be rejected. These rejections can be detected by upstream limiters as load-based failures, acting as an effective form of backpressure.
+[Additional documentation](./docs/index.md)
 
-In general, systems serving clients by doing jobs have a finite number of resources. For example, an HTTP server might have 4 CPU cores available. When these resources become heavily utilised, queues begin to form, and job latency increases. If these queues continue to grow, the system becomes effectively overloaded and unable to respond to job requests in a reasonable time.
+## The problem
 
-These systems can only process so many jobs concurrently. For a purely CPU-bound job, the server above might only be able to process about 4 jobs concurrently. Reality is much more complex, however, and therefore this number is much harder to predict.
+When a service is overwhelmed with more work than it can handle, everything degrades. Latency spikes, requests start failing, and those failures cascade through the system. Services need a way to detect this and shed excess load before it causes damage.
 
-Concurrency limits can help protect a system from becoming overloaded, and these limits can be automatically set by observing and responding to the behaviour of the system.
+## Why not rate limiting?
 
-See [background](./docs/background.md) for more details.
+Rate limiting — controlling the number of requests per second — is the most common defence. But it's one-dimensional: it doesn't consider how long work takes.
+
+Think of it like a nightclub. Rate limiting is controlling how many people enter per minute. Concurrency limiting is controlling how many people are inside at once. If people start staying longer, a rate limit still lets the same number in, and the place gets dangerously overcrowded. A concurrency limit naturally adapts: if people stay longer, fewer new people are admitted.
+
+This matters in practice. When latency increases — because of expensive requests, reduced capacity, or a downstream slowdown — a rate limit still lets the same volume of traffic through, making overload worse. A concurrency limit automatically admits fewer requests, because existing ones are taking longer to complete.
+
+See [why concurrency limiting](./docs/why-concurrency-limiting.md) for a worked example and the full argument.
+
+## Why dynamic?
+
+Even with a concurrency limit, what should the number be? It depends on the system, the workload, and downstream capacity — and all of these change over time. A static limit that was right yesterday might be too low today (wasting capacity) or too high (not protecting the system).
+
+This library discovers the right limit automatically, by observing system behaviour and adjusting.
+
+## How it works
+
+The library observes job latency and failure rates, and adjusts the concurrency limit using algorithms based on [TCP congestion control](https://en.wikipedia.org/wiki/TCP_congestion_control). When things are going well, the limit increases. When latency rises or failures are detected, the limit decreases. Beyond the limit, requests are rejected, providing backpressure to upstream systems.
+
+For an intuitive walkthrough, see the [supermarket analogy](./docs/supermarket-analogy.md). For technical detail on the detection mechanisms, see [how detection works](./docs/how-detection-works.md).
 
 ## Goals
 
@@ -24,24 +49,55 @@ This library aims to:
 2. Shed load and apply backpressure in response to congestion or overload.
 3. Fairly distribute available resources between independent clients with zero coordination.
 
-## Limit algorithms
+## Example
 
-The congestion-based algorithms come in several flavours:
+```rust
+use congestion_limiter::{limits::Aimd, limiter::{Limiter, Outcome}};
 
-- **Loss-based** – respond to failed jobs (i.e. overload). Feedback can be implicit (e.g. a timeout) or explicit (e.g. an HTTP 429 or 503 status).
-- **Delay-based** – respond to increases in latency (i.e. congestion). Feedback is implicit.
+// Create a limiter with the AIMD algorithm.
+// This can be shared between request handlers (Limiter is cheaply cloneable).
+let limiter = Limiter::new(
+    Aimd::new_with_initial_limit(10)
+        .with_max_limit(20)
+        .decrease_factor(0.9)
+        .increase_by(1),
+);
 
-| Algorithm                         | Feedback       | Response             | [Fairness](https://en.wikipedia.org/wiki/Fairness_measure)                                       |
-|-----------------------------------|----------------|----------------------|--------------------------------------------------------------------------------------------------|
-| [AIMD](src/limit/aimd.rs)         | Loss           | AIMD                 | Fair, but can out-compete delay-based algorithms                                                 |
-| [Gradient](src/limit/gradient.rs) | Delay          | AIMD                 | TODO: ?                                                                                          |
-| [Vegas](src/limit/vegas.rs)       | Loss and delay | AIAD (AIMD for loss) | [Proportional](https://en.wikipedia.org/wiki/Proportional-fair_scheduling) until overload (loss) |
+// A request handler
+tokio_test::block_on(async move {
+    // Try to acquire a token. Returns None if the limit has been reached.
+    let token = limiter.try_acquire()
+        .expect("No capacity available — Loss-based algorithms would see this as an overload signal");
+
+    // Do some work...
+
+    // Report the outcome so the algorithm can adjust the limit.
+    token.set_outcome(Outcome::Success).await;
+});
+```
+
+## Algorithms
+
+The algorithms detect congestion or overload by observing two types of feedback:
+
+- **Loss-based** — react to job failures caused by overload. Feedback can be explicit (e.g. HTTP 429 or 503) or implicit (e.g. a timeout).
+- **Delay-based** — react to increases in latency, a sign of growing queues. Feedback is implicit.
+
+| Algorithm                          | Feedback       | Response             | [Fairness](https://en.wikipedia.org/wiki/Fairness_measure)                                       |
+|------------------------------------|----------------|----------------------|--------------------------------------------------------------------------------------------------|
+| [AIMD](src/limits/aimd.rs)         | Loss           | AIMD                 | Fair, but can out-compete delay-based algorithms                                                 |
+| [Gradient](src/limits/gradient.rs) | Delay          | AIMD                 | TODO: ?                                                                                          |
+| [Vegas](src/limits/vegas.rs)       | Loss and delay | AIAD (AIMD for loss) | [Proportional](https://en.wikipedia.org/wiki/Proportional-fair_scheduling) until overload (loss) |
+
+See [how detection works](./docs/how-detection-works.md) for more on delay-based vs loss-based detection.
 
 ### Example topology
 
 The example below shows two applications using limiters on the client (output) and on the server (input), using different algorithms for each.
 
 ![Example topology](docs/assets/example-topology.png)
+
+See [architecture patterns](./docs/architecture-patterns.md) for guidance on server-side vs client-side limiting.
 
 ### Caveats
 
@@ -60,39 +116,6 @@ The example below shows two applications using limiters on the client (output) a
 
 No! The congestion avoidance is based on TCP congestion control algorithms which are designed to work independently. In TCP, each transmitting socket independently detects congestion and reacts accordingly.
 
-## Installing, running and testing
-
-TODO:
-
-## Example
-
-```rust
-use std::sync::Arc;
-use congestion_limiter::{limits::Aimd, limiter::{Limiter, Outcome}};
-
-// A limiter shared between request handler invocations.
-// This controls the concurrency of incoming requests.
-let limiter = Limiter::new(
-    Aimd::new_with_initial_limit(10)
-        .with_max_limit(20)
-        .decrease_factor(0.9)
-        .increase_by(1),
-);
-
-// A request handler
-tokio_test::block_on(async move {
-    // On request start
-    let token = limiter.try_acquire()
-        .await
-        .expect("Do some proper error handling instead of this...");
-
-    // Do some work...
-
-    // On request finish
-    token.set_outcome(Outcome::Success).await;
-});
-```
-
 ## Prior art
 
 - Netflix
@@ -101,14 +124,14 @@ tokio_test::block_on(async move {
 
 ## Further reading
 
-- [Wikipedia -- TCP congestion control](https://en.wikipedia.org/wiki/TCP_congestion_control)
-- [AWS -- Using load shedding to avoid overload](https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/)
-- [Sarah-Marie Nothling -- Load Series: Throttling vs Loadshedding](https://sarahnothling.wordpress.com/2019/05/12/load-series-throttling-vs-loadshedding/)
-- [Myntra Engineering -- Adaptive Throttling of Indexing for Improved Query Responsiveness](https://medium.com/myntra-engineering/adaptive-throttling-of-indexing-for-improved-query-responsiveness-b3ac949e76c9)
+- [Wikipedia — TCP congestion control](https://en.wikipedia.org/wiki/TCP_congestion_control)
+- [AWS — Using load shedding to avoid overload](https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/)
+- [Sarah-Marie Nothling — Load Series: Throttling vs Loadshedding](https://sarahnothling.wordpress.com/2019/05/12/load-series-throttling-vs-loadshedding/)
+- [Myntra Engineering — Adaptive Throttling of Indexing for Improved Query Responsiveness](https://medium.com/myntra-engineering/adaptive-throttling-of-indexing-for-improved-query-responsiveness-b3ac949e76c9)
 - [TCP Congestion Control: A Systems Approach](https://tcpcc.systemsapproach.org/index.html)
-- [LWN -- Delay-gradient congestion control (CDG)](https://lwn.net/Articles/645115/)
-- [Strange Loop -- Stop Rate Limiting! Capacity Management Done Right](https://www.youtube.com/watch?v=m64SWl9bfvk)
-- [Marc Brooker -- Telling Stories About Little's Law](https://brooker.co.za/blog/2018/06/20/littles-law.html)
+- [LWN — Delay-gradient congestion control (CDG)](https://lwn.net/Articles/645115/)
+- [Strange Loop — Stop Rate Limiting! Capacity Management Done Right](https://www.youtube.com/watch?v=m64SWl9bfvk)
+- [Marc Brooker — Telling Stories About Little's Law](https://brooker.co.za/blog/2018/06/20/littles-law.html)
 - [Queuing theory: Definition, history & real-life applications & examples](https://queue-it.com/blog/queuing-theory/)
 
 ## License
