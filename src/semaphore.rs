@@ -222,6 +222,38 @@ impl Semaphore {
         }
     }
 
+    pub fn available_permits(&self) -> usize {
+        self.available_permits.load(atomic::Ordering::Acquire)
+    }
+
+    pub fn add_permits(self: Arc<Self>, n: usize) {
+        // Wake up to n queued waiters, then add any remaining to available_permits.
+        let mut queue = self.queue.lock().expect("lock should not be poisoned");
+        let to_wake = n.min(queue.len());
+        for _ in 0..to_wake {
+            let entry = queue.pop_front().expect("just checked len");
+            let _ = entry.sender.send(Ok(Permit {
+                semaphore: Some(Arc::clone(&self)),
+            }));
+        }
+        let remaining = n - to_wake;
+        if remaining > 0 {
+            self.available_permits
+                .fetch_add(remaining, atomic::Ordering::Release);
+        }
+    }
+
+    pub async fn acquire_many(self: Arc<Self>, n: u32) -> Result<Vec<Permit>, AcquireError> {
+        let mut permits = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let permit = Arc::clone(&self)
+                .acquire_timeout(std::time::Duration::MAX)
+                .await?;
+            permits.push(permit);
+        }
+        Ok(permits)
+    }
+
     fn cancel(&self, id: EntryId) {
         let mut queue = self.queue.lock().expect("lock should not be poisoned");
         if let Ok(index) = queue.binary_search_by_key(&id, |entry| entry.id) {
@@ -269,12 +301,10 @@ impl Future for Acquire {
     ) -> std::task::Poll<Self::Output> {
         std::pin::Pin::new(&mut self.as_mut().receiver)
             .poll(cx)
-            .map(|r| {
-                match r {
-                    Ok(Ok(permit)) => Ok(permit),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(AcquireError::Closed),
-                }
+            .map(|r| match r {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(AcquireError::Closed),
             })
     }
 }
@@ -285,12 +315,20 @@ impl Drop for Acquire {
     }
 }
 
+impl Permit {
+    /// Forget the permit without returning it to the semaphore.
+    ///
+    /// This permanently removes a permit from the pool, reducing the effective limit by 1.
+    pub fn forget(mut self) {
+        self.semaphore = None;
+    }
+}
+
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.semaphore
-            .take()
-            .expect("semaphore should exist until dropped")
-            .return_permit();
+        if let Some(semaphore) = self.semaphore.take() {
+            semaphore.return_permit();
+        }
     }
 }
 
@@ -446,5 +484,224 @@ mod tests {
 
         let res = semaphore.acquire_timeout(Duration::from_secs(1)).await;
         assert_matches!(res, Err(AcquireError::Closed));
+    }
+
+    /// Regression test: when a waiter acquires a permit via the queue, the permit count must
+    /// remain consistent (i.e. the permit is not double-returned).
+    #[tokio::test(start_paused = true)]
+    async fn queued_acquire_does_not_double_return_permit() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(1).max_queue_size(1).build(),
+        ));
+
+        let p1 = semaphore.clone().try_acquire().unwrap();
+
+        // Queue up a waiter
+        let waiter = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await.unwrap() }
+        });
+
+        // Release p1; the waiter should receive the permit
+        drop(p1);
+        let p2 = waiter.await.unwrap();
+
+        // Only 1 permit should be in circulation: p2
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // After dropping p2 we should be back to exactly 1 available permit
+        drop(p2);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    /// Regression test: queue full error is returned at exactly the configured limit.
+    #[tokio::test]
+    async fn queue_full_error() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(1).max_queue_size(1).build(),
+        ));
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+
+        // First waiter fills the queue
+        let _waiter = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await }
+        });
+        // Yield so the waiter actually enters the queue
+        tokio::task::yield_now().await;
+
+        // Second waiter should be rejected
+        let res = semaphore.clone().acquire_timeout(Duration::ZERO).await;
+        assert_matches!(res, Err(AcquireError::QueueFull));
+    }
+
+    /// `add_permits` wakes exactly as many queued waiters as new permits added.
+    #[tokio::test(start_paused = true)]
+    async fn add_permits_wakes_waiters() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(1).max_queue_size(3).build(),
+        ));
+
+        // Fill up all permits
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+
+        // Queue up 2 waiters
+        let waiter1 = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await }
+        });
+        let waiter2 = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(semaphore.queue.lock().unwrap().len(), 2);
+
+        // Add 2 permits: both waiters should be woken, nothing left in available.
+        semaphore.clone().add_permits(2);
+        tokio::task::yield_now().await;
+
+        // Check while tasks still hold their permits (before awaiting them, which drops the
+        // permits and returns them to the pool).
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(semaphore.queue.lock().unwrap().len(), 0);
+
+        assert!(waiter1.await.unwrap().is_ok());
+        assert!(waiter2.await.unwrap().is_ok());
+    }
+
+    /// `add_permits` with more permits than waiters puts the surplus into available_permits.
+    #[tokio::test(start_paused = true)]
+    async fn add_permits_surplus_goes_to_available() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(2).max_queue_size(1).build(),
+        ));
+
+        // Hold both permits
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p2 = semaphore.clone().try_acquire().unwrap();
+
+        // Queue up 1 waiter
+        let waiter = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Add 3 permits: 1 goes to the waiter, 2 remain available.
+        semaphore.clone().add_permits(3);
+        tokio::task::yield_now().await;
+
+        // Check while waiter still holds its permit.
+        assert_eq!(semaphore.available_permits(), 2);
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    /// Forgetting a permit permanently removes it from the pool.
+    #[tokio::test]
+    async fn forget_reduces_pool_size() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(3).max_queue_size(0).build(),
+        ));
+
+        assert_eq!(semaphore.available_permits(), 3);
+
+        let p = semaphore.clone().try_acquire().unwrap();
+        p.forget();
+
+        assert_eq!(semaphore.available_permits(), 2);
+
+        // Confirm the remaining permits still work normally
+        let p2 = semaphore.clone().try_acquire().unwrap();
+        drop(p2);
+        assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    /// `acquire_many` acquires exactly n permits.
+    #[tokio::test]
+    async fn acquire_many_acquires_n_permits() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(5).max_queue_size(0).build(),
+        ));
+
+        let permits = semaphore.clone().acquire_many(3).await.unwrap();
+        assert_eq!(permits.len(), 3);
+        assert_eq!(semaphore.available_permits(), 2);
+
+        drop(permits);
+        assert_eq!(semaphore.available_permits(), 5);
+    }
+
+    /// `acquire_many` blocks until all permits are available.
+    #[tokio::test(start_paused = true)]
+    async fn acquire_many_waits_for_permits() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(2).max_queue_size(3).build(),
+        ));
+
+        // Hold both permits
+        let p1 = semaphore.clone().try_acquire().unwrap();
+        let p2 = semaphore.clone().try_acquire().unwrap();
+
+        let done = Arc::new(Mutex::new(false));
+        let task = tokio::spawn({
+            let semaphore = semaphore.clone();
+            let done = done.clone();
+            async move {
+                let permits = semaphore.acquire_many(2).await.unwrap();
+                *done.lock().unwrap() = true;
+                permits
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!*done.lock().unwrap(), "should still be waiting");
+
+        drop(p1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!*done.lock().unwrap(), "still waiting for second permit");
+
+        drop(p2);
+        let permits = task.await.unwrap();
+        assert!(*done.lock().unwrap());
+        assert_eq!(permits.len(), 2);
+    }
+
+    /// Waiters are served in FIFO order.
+    #[tokio::test(start_paused = true)]
+    async fn fifo_ordering() {
+        let semaphore = Arc::new(Semaphore::new(
+            Options::builder().max_permits(1).max_queue_size(3).build(),
+        ));
+
+        let p1 = semaphore.clone().try_acquire().unwrap();
+
+        let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let make_waiter = |n: u32| {
+            let semaphore = semaphore.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _p = semaphore.acquire_timeout(Duration::MAX).await.unwrap();
+                order.lock().unwrap().push(n);
+                // _p dropped here: wakes the next waiter in the queue
+            })
+        };
+
+        let w1 = make_waiter(1);
+        let w2 = make_waiter(2);
+        let w3 = make_waiter(3);
+
+        // Let all waiters enter the queue
+        tokio::task::yield_now().await;
+        assert_eq!(semaphore.queue.lock().unwrap().len(), 3);
+
+        // Releasing p1 wakes w1; each task drops its permit on exit, waking the next.
+        drop(p1);
+        w1.await.unwrap();
+        w2.await.unwrap();
+        w3.await.unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
     }
 }
