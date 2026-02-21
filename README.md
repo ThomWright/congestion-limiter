@@ -56,12 +56,15 @@ use congestion_limiter::{limits::Aimd, limiter::{Limiter, Outcome}};
 
 // Create a limiter with the AIMD algorithm.
 // This can be shared between request handlers (Limiter is cheaply cloneable).
-let limiter = Limiter::new(
-    Aimd::new_with_initial_limit(10)
-        .with_max_limit(20)
-        .decrease_factor(0.9)
-        .increase_by(1),
-);
+let limiter = Limiter::builder()
+    .limit_algo(
+        Aimd::new_with_initial_limit(10)
+            .with_max_limit(20)
+            .decrease_factor(0.9)
+            .increase_by(1),
+    )
+    .max_queue_size(1024)
+    .build();
 
 // A request handler
 tokio_test::block_on(async move {

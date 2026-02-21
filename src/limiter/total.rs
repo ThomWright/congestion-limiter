@@ -5,13 +5,10 @@ use std::{
     time::Duration,
 };
 
-use conv::ValueFrom;
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    time::timeout,
+use crate::{
+    limits::{LimitAlgorithm, Sample},
+    semaphore::{AcquireError, Permit, Semaphore},
 };
-
-use crate::limits::{LimitAlgorithm, Sample};
 
 use super::{AtomicCapacityUnit, CapacityUnit, Outcome};
 
@@ -33,13 +30,18 @@ impl<T> TotalLimiter<T>
 where
     T: LimitAlgorithm,
 {
-    pub(crate) fn new(limit_algo: T) -> Self {
+    pub(crate) fn new(limit_algo: T, max_queue_size: usize) -> Self {
         let initial_permits = limit_algo.limit();
         assert!(initial_permits >= 1);
 
         TotalLimiter {
             limit_algo,
-            semaphore: Arc::new(Semaphore::new(initial_permits)),
+            semaphore: Arc::new(
+                Semaphore::builder()
+                    .max_permits(initial_permits)
+                    .max_queue_size(max_queue_size)
+                    .build(),
+            ),
             limit: AtomicCapacityUnit::new(initial_permits),
             in_flight: AtomicCapacityUnit::new(0),
 
@@ -66,6 +68,7 @@ where
         self.semaphore.available_permits()
     }
 
+
     pub(crate) fn limit(&self) -> CapacityUnit {
         self.limit.load(atomic::Ordering::Acquire)
     }
@@ -82,30 +85,34 @@ where
         self.in_flight.fetch_sub(1, atomic::Ordering::SeqCst) - 1
     }
 
-    pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        match Arc::clone(&self.semaphore).try_acquire_owned() {
+    pub(crate) fn try_acquire(&self) -> Option<Permit> {
+        match Arc::clone(&self.semaphore).try_acquire() {
             Ok(permit) => {
                 self.inc_in_flight();
                 Some(permit)
             }
-            Err(TryAcquireError::NoPermits) => None,
-
-            Err(TryAcquireError::Closed) => {
+            Err(AcquireError::NoPermits) => None,
+            Err(AcquireError::Closed) => {
                 panic!("we own the semaphore, we shouldn't have closed it")
+            }
+            Err(AcquireError::QueueFull | AcquireError::Timeout) => {
+                unreachable!("try_acquire does not use the queue or a timeout")
             }
         }
     }
 
-    pub(crate) async fn acquire_timeout(&self, duration: Duration) -> Option<OwnedSemaphorePermit> {
-        match timeout(duration, Arc::clone(&self.semaphore).acquire_owned()).await {
-            Ok(Ok(permit)) => {
+    pub(crate) async fn acquire_timeout(&self, duration: Duration) -> Option<Permit> {
+        match Arc::clone(&self.semaphore).acquire_timeout(duration).await {
+            Ok(permit) => {
                 self.inc_in_flight();
                 Some(permit)
             }
-            Err(_) => None,
-
-            Ok(Err(_)) => {
+            Err(AcquireError::Timeout | AcquireError::QueueFull) => None,
+            Err(AcquireError::Closed) => {
                 panic!("we own the semaphore, we shouldn't have closed it")
+            }
+            Err(AcquireError::NoPermits) => {
+                unreachable!("acquire_timeout queues when no permits are available")
             }
         }
     }
@@ -119,7 +126,7 @@ where
 
         match new_limit.cmp(&old_limit) {
             cmp::Ordering::Greater => {
-                self.semaphore.add_permits(new_limit - old_limit);
+                Arc::clone(&self.semaphore).add_permits(new_limit - old_limit);
 
                 #[cfg(test)]
                 if let Some(n) = &self.notifier {
@@ -127,32 +134,16 @@ where
                 }
             }
             cmp::Ordering::Less => {
-                let semaphore = self.semaphore.clone();
+                // Consume available permits immediately; any remainder is consumed asynchronously
+                // as in-flight permits are returned, taking priority over queued waiters.
+                self.semaphore.decrease_permits(old_limit - new_limit);
+
                 #[cfg(test)]
-                let notifier = self.notifier.clone();
-
-                tokio::spawn(async move {
-                    // If there aren't enough permits available then this will wait until enough
-                    // become available. This could take a while, so we do this in the background.
-                    let permits = semaphore
-                        .acquire_many(
-                            u32::value_from(old_limit - new_limit)
-                                .expect("change in limit shouldn't be > u32::MAX"),
-                        )
-                        .await
-                        .expect("we own the semaphore, we shouldn't have closed it");
-
-                    // Acquiring some permits and throwing them away reduces the available limit.
-                    permits.forget();
-
-                    #[cfg(test)]
-                    if let Some(n) = notifier {
-                        n.notify_one();
-                    }
-                });
+                if let Some(n) = &self.notifier {
+                    n.notify_one();
+                }
             }
-            _ =>
-            {
+            _ => {
                 #[cfg(test)]
                 if let Some(n) = &self.notifier {
                     n.notify_one();
@@ -163,7 +154,7 @@ where
         new_limit
     }
 
-    pub(crate) fn release(&self, permit: OwnedSemaphorePermit) {
+    pub(crate) fn release(&self, permit: Permit) {
         self.dec_in_flight();
         drop(permit);
     }
@@ -186,7 +177,7 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
+        let limiter = TotalLimiter::new(Arc::clone(&mock_algo), 100);
 
         let permit = limiter.try_acquire().expect("enough capacity");
 
@@ -206,7 +197,7 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
+        let limiter = TotalLimiter::new(Arc::clone(&mock_algo), 100);
 
         let permit = limiter.try_acquire().expect("enough capacity");
 
@@ -232,7 +223,7 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
+        let limiter = TotalLimiter::new(Arc::clone(&mock_algo), 100);
 
         let permit = limiter.try_acquire().expect("enough capacity");
 
@@ -255,7 +246,7 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
+        let limiter = TotalLimiter::new(Arc::clone(&mock_algo), 100);
 
         let permit = limiter.try_acquire().expect("enough capacity");
 
@@ -265,9 +256,6 @@ mod tests {
             .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit);
-
-        // Give an opportunity to decrease the available permits in the background
-        tokio::task::yield_now().await;
 
         assert_eq!(limiter.limit(), 5, "limit");
         assert_eq!(limiter.in_flight(), 0, "in flight");
@@ -279,7 +267,7 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = TotalLimiter::new(Arc::clone(&mock_algo));
+        let limiter = TotalLimiter::new(Arc::clone(&mock_algo), 100);
 
         let permit1 = limiter.try_acquire().expect("enough capacity");
         let permit2 = limiter.try_acquire().expect("enough capacity");
@@ -292,9 +280,6 @@ mod tests {
             .await;
         limiter.release(permit1);
 
-        // Give an opportunity to decrease the available permits in the background
-        tokio::task::yield_now().await;
-
         assert_eq!(limiter.limit(), 1, "limit");
         assert_eq!(limiter.in_flight(), 2, "in flight");
         assert_eq!(limiter.available(), 0, "available");
@@ -304,9 +289,6 @@ mod tests {
             .await;
         limiter.release(permit2);
 
-        // Give an opportunity to decrease the available permits in the background
-        tokio::task::yield_now().await;
-
         assert_eq!(limiter.limit(), 1, "limit");
         assert_eq!(limiter.in_flight(), 1, "in flight");
         assert_eq!(limiter.available(), 0, "available");
@@ -315,9 +297,6 @@ mod tests {
             .update_limit(Outcome::Success, Duration::from_secs(1))
             .await;
         limiter.release(permit3);
-
-        // Give an opportunity to decrease the available permits in the background
-        tokio::task::yield_now().await;
 
         assert_eq!(limiter.limit(), 1, "limit");
         assert_eq!(limiter.in_flight(), 0, "in flight");

@@ -36,9 +36,9 @@
     - How possible would it be to partition somewhat dynamically? E.g. on customer IDs?
   - [ ] LIFO for jobs waiting for a token
     - Optimise for latency
-- [ ] Documentation
-  - [ ] README
-    - [ ] Examples
-  - [ ] Rustdoc `#![warn(missing_docs)]`
-    - [ ] Examples
-  - [ ] Move most docs into Rust doc format to view in e.g. crates.io
+- [x] Documentation
+  - [x] README
+    - [x] Examples
+  - [x] Rustdoc `#![warn(missing_docs)]`
+    - [x] Examples
+  - [x] Move most docs into Rust doc format to view in e.g. crates.io

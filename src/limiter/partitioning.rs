@@ -5,11 +5,14 @@ use std::{
     time::Duration,
 };
 
+use bon::bon;
 use conv::{ConvAsUtil, ConvUtil};
 use tokio::{
-    sync::{oneshot, OwnedSemaphorePermit},
+    sync::oneshot,
     time::{timeout, Instant},
 };
+
+use crate::semaphore::Permit;
 
 use crate::{
     limiter::{Outcome, Token},
@@ -45,9 +48,10 @@ struct PartitionState {
     in_flight: AtomicCapacityUnit,
 
     // TODO: remove from queue when dropped/cancelled
-    job_queue: Mutex<VecDeque<(Instant, oneshot::Sender<OwnedSemaphorePermit>)>>,
+    job_queue: Mutex<VecDeque<(Instant, oneshot::Sender<Permit>)>>,
 }
 
+#[bon]
 impl<T> PartitionedLimiter<T>
 where
     T: LimitAlgorithm + Send + 'static,
@@ -58,12 +62,21 @@ where
     /// partitions of 25%, 25% and 50% of the total limit, respectively.
     ///
     /// `weights` must not be empty.
-    pub fn new(limit_algo: T, weights: Vec<f64>) -> Vec<Arc<Self>> {
+    ///
+    /// `max_queue_size` bounds how many callers can wait for a token at once;
+    /// excess callers receive an immediate rejection. Use [`usize::MAX`] to allow unbounded
+    /// waiting.
+    #[builder]
+    pub fn new(
+        limit_algo: T,
+        weights: Vec<f64>,
+        #[builder(default = usize::MAX)] max_queue_size: usize,
+    ) -> Vec<Arc<Self>> {
         // TODO: explicitly allow or disallow borrowing?
 
         let num_partitions = weights.len();
 
-        let total_limiter = TotalLimiter::new(limit_algo);
+        let total_limiter = TotalLimiter::new(limit_algo, max_queue_size);
         let scheduler = Scheduler::new(total_limiter, weights);
 
         let mut partitions = Vec::with_capacity(num_partitions);
@@ -101,7 +114,7 @@ where
             .map(|permit| self.mint_token(permit))
     }
 
-    fn mint_token(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> Token {
+    fn mint_token(self: &Arc<Self>, permit: Permit) -> Token {
         Token::new(permit, Arc::clone(self))
     }
 }
@@ -147,7 +160,7 @@ where
         partition_state.state(self.total_limiter.limit())
     }
 
-    fn try_acquire(self: &Arc<Self>, index: StateIndex) -> Option<OwnedSemaphorePermit> {
+    fn try_acquire(self: &Arc<Self>, index: StateIndex) -> Option<Permit> {
         let partition = &self.partition_states[index];
 
         let total_limit = self.total_limiter.limit();
@@ -168,7 +181,7 @@ where
         &self,
         duration: Duration,
         index: StateIndex,
-    ) -> Option<OwnedSemaphorePermit> {
+    ) -> Option<Permit> {
         let partition = self
             .partition_states
             .get(index)
@@ -269,7 +282,7 @@ where
     /// The underlying semaphore is simply a FIFO queue. Instead, what we want is a kind of priority
     /// queue, where the priority is based on the time a job has been waiting and the weight of the
     /// partition.
-    fn recycle_permit(self: &Arc<Self>, permit: OwnedSemaphorePermit, index: StateIndex) {
+    fn recycle_permit(self: &Arc<Self>, permit: Permit, index: StateIndex) {
         self.partition_states[index].dec_in_flight();
 
         /// Like a normal FIFO queue, items which arrive first have higher priority.
@@ -331,7 +344,7 @@ impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
             .await
     }
 
-    fn release(&self, permit: OwnedSemaphorePermit) {
+    fn release(&self, permit: Permit) {
         self.scheduler.recycle_permit(permit, self.state_index);
     }
 }
@@ -425,7 +438,10 @@ mod tests {
         mock_algo.set_limit(10);
 
         let weights = vec![0.5, 0.5];
-        let partitions = PartitionedLimiter::new(Arc::clone(&mock_algo), weights);
+        let partitions = PartitionedLimiter::builder()
+            .limit_algo(Arc::clone(&mock_algo))
+            .weights(weights)
+            .build();
 
         // Initial conditions
         assert_eq!(partitions.len(), 2);
@@ -462,7 +478,10 @@ mod tests {
         mock_algo.set_limit(4);
 
         let weights = vec![0.5, 0.5];
-        let partitions = PartitionedLimiter::new(Arc::clone(&mock_algo), weights);
+        let partitions = PartitionedLimiter::builder()
+            .limit_algo(Arc::clone(&mock_algo))
+            .weights(weights)
+            .build();
 
         // Initial conditions
         assert_eq!(partitions.len(), 2);
@@ -503,7 +522,10 @@ mod tests {
         mock_algo.set_limit(4);
 
         let weights = vec![0.5, 0.5];
-        let partitions = PartitionedLimiter::new(Arc::clone(&mock_algo), weights);
+        let partitions = PartitionedLimiter::builder()
+            .limit_algo(Arc::clone(&mock_algo))
+            .weights(weights)
+            .build();
 
         // Initial conditions
         assert_eq!(partitions.len(), 2);

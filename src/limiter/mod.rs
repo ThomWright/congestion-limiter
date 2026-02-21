@@ -6,9 +6,9 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::OwnedSemaphorePermit;
+use bon::bon;
 
-use crate::limits::LimitAlgorithm;
+use crate::{limits::LimitAlgorithm, semaphore::Permit};
 use total::TotalLimiter;
 
 pub use partitioning::PartitionedLimiter;
@@ -71,24 +71,35 @@ pub(crate) trait Releaser: Debug {
     /// TODO: do we need to return the new limit?
     async fn update_limit(&self, outcome: Outcome, latency: Duration) -> CapacityUnit;
 
-    fn release(&self, permit: OwnedSemaphorePermit);
+    fn release(&self, permit: Permit);
 }
 
+#[bon]
 impl<T> Limiter<T>
 where
     T: LimitAlgorithm + Send + 'static,
 {
     /// Create a limiter with a given limit control algorithm.
-    pub fn new(limit_algo: T) -> Arc<Self> {
+    ///
+    /// `max_queue_size` bounds how many callers can wait for a token at once;
+    /// excess callers receive an immediate rejection. Use [`usize::MAX`] to allow unbounded
+    /// waiting.
+    #[builder]
+    pub fn new(limit_algo: T, #[builder(default = usize::MAX)] max_queue_size: usize) -> Arc<Self> {
         Arc::new(Self {
-            total_limiter: TotalLimiter::new(limit_algo),
+            total_limiter: TotalLimiter::new(limit_algo, max_queue_size),
         })
     }
 
-    /// In some cases [Token]s are acquired asynchronously when updating the limit.
+    /// When the limit decreases and not all permits are immediately available, the remainder is
+    /// consumed asynchronously as in-flight permits are returned.
     #[cfg(test)]
-    pub fn new_with_release_notifier(limit_algo: T, n: Arc<tokio::sync::Notify>) -> Arc<Self> {
-        let mut limiter = TotalLimiter::new(limit_algo);
+    pub fn new_with_release_notifier(
+        limit_algo: T,
+        max_queue_size: usize,
+        n: Arc<tokio::sync::Notify>,
+    ) -> Arc<Self> {
+        let mut limiter = TotalLimiter::new(limit_algo, max_queue_size);
         limiter.with_release_notifier(n);
         Arc::new(Self {
             total_limiter: limiter,
@@ -123,7 +134,7 @@ where
             .map(|permit| self.mint_token(permit))
     }
 
-    fn mint_token(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> Token {
+    fn mint_token(self: &Arc<Self>, permit: Permit) -> Token {
         Token::new(permit, Arc::clone(self))
     }
 }
@@ -134,7 +145,7 @@ impl<T: LimitAlgorithm + Debug + Sync> Releaser for Limiter<T> {
         self.total_limiter.update_limit(outcome, latency).await
     }
 
-    fn release(&self, permit: OwnedSemaphorePermit) {
+    fn release(&self, permit: Permit) {
         self.total_limiter.release(permit);
     }
 }
@@ -178,7 +189,7 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = Limiter::new(Arc::clone(&mock_algo));
+        let limiter = Limiter::builder().limit_algo(Arc::clone(&mock_algo)).build();
 
         let mut token = limiter.try_acquire().unwrap();
 
@@ -202,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_token() {
-        let limiter = Limiter::new(Fixed::new(10));
+        let limiter = Limiter::builder().limit_algo(Fixed::new(10)).build();
 
         let token = limiter.try_acquire().unwrap();
 

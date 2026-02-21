@@ -168,7 +168,7 @@ mod tests {
 
         let release_notifier = Arc::new(Notify::new());
 
-        let limiter = Limiter::new_with_release_notifier(aimd, release_notifier.clone());
+        let limiter = Limiter::new_with_release_notifier(aimd, 100, release_notifier.clone());
 
         let token = limiter.try_acquire().unwrap();
         token.set_outcome(Outcome::Overload).await;
@@ -183,7 +183,7 @@ mod tests {
             .increase_by(1)
             .with_min_utilisation_threshold(0.5);
 
-        let limiter = Limiter::new(aimd);
+        let limiter = Limiter::builder().limit_algo(aimd).build();
 
         let token = limiter.try_acquire().unwrap();
         let _token = limiter.try_acquire().unwrap();
@@ -201,7 +201,7 @@ mod tests {
             .increase_by(1)
             .with_min_utilisation_threshold(0.5);
 
-        let limiter = Limiter::new(aimd);
+        let limiter = Limiter::builder().limit_algo(aimd).build();
 
         let token = limiter.try_acquire().unwrap();
 
@@ -219,7 +219,7 @@ mod tests {
             .decrease_factor(0.5)
             .increase_by(1);
 
-        let limiter = Limiter::new(aimd);
+        let limiter = Limiter::builder().limit_algo(aimd).build();
 
         let token = limiter.try_acquire().unwrap();
         drop(token);

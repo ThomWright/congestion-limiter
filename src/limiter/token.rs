@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use tokio::{sync::OwnedSemaphorePermit, time::Instant};
+use tokio::time::Instant;
+
+use crate::semaphore::Permit;
 
 use super::{CapacityUnit, Outcome, Releaser};
 
@@ -10,7 +12,7 @@ use super::{CapacityUnit, Outcome, Releaser};
 #[must_use = "Call `limiter.set_outcome()` with this token once done."]
 #[derive(Debug)]
 pub struct Token {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<Permit>,
     releaser: Arc<dyn Releaser + Sync + Send>,
 
     start: Instant,
@@ -20,7 +22,7 @@ pub struct Token {
 
 impl Token {
     pub(crate) fn new(
-        permit: OwnedSemaphorePermit,
+        permit: Permit,
         releaser: Arc<impl Releaser + Sync + Send + 'static>,
     ) -> Self {
         Self {

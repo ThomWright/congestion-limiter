@@ -16,29 +16,18 @@ use std::{
     },
 };
 
-use bon::{bon, Builder};
+use bon::bon;
 use tokio::{sync::oneshot, time::Instant};
-
-// Design options:
-// 1. Atomics + Mutex<VecDeque>
-// 2. Channels to a task with an event loop (simple usize + VecDeque)
-//    Would need to put limits on the channel length...
-
-// TODO:
-// - Basic impl
-// - Permit drop
-// - Closed state
-// - forgetting a permit
-// - queue size limit
-// - acquire many
-// - high priority acquire (to reduce number of permits when system is under load)
-// - queue prioritisation strategy
 
 #[derive(Debug)]
 pub struct Semaphore {
     available_permits: AtomicUsize,
     queue: Mutex<VecDeque<QueueEntry>>,
     max_queue_size: usize,
+    /// Number of returning permits to silently consume rather than return to the pool or wake a
+    /// waiter. Checked before the queue in [`Semaphore::return_permit`], so these take priority
+    /// over queued waiters.
+    priority_reduction: AtomicUsize,
     // The tokio implementation has a nice optimisation where the closed state is a bitmask over
     // `available_permits` (a few bits are reserved for flags), so it can load the complete state
     // atomically.
@@ -89,8 +78,9 @@ impl Semaphore {
     pub fn new(max_permits: usize, max_queue_size: usize) -> Self {
         Self {
             available_permits: AtomicUsize::new(max_permits),
-            queue: Mutex::new(VecDeque::with_capacity(max_queue_size)),
+            queue: Mutex::new(VecDeque::with_capacity(max_queue_size.min(64))),
             max_queue_size,
+            priority_reduction: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         }
     }
@@ -205,6 +195,20 @@ impl Semaphore {
     }
 
     fn return_permit(self: Arc<Self>) {
+        // Priority: satisfy pending reductions before waking queued waiters.
+        let mut pending = self.priority_reduction.load(atomic::Ordering::Acquire);
+        while pending > 0 {
+            match self.priority_reduction.compare_exchange(
+                pending,
+                pending - 1,
+                atomic::Ordering::AcqRel,
+                atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return, // permit consumed; not returned to pool or queue
+                Err(v) => pending = v,
+            }
+        }
+
         let mut queue = self.queue.lock().expect("lock should not be poisoned");
         if let Some(entry) = queue.pop_front() {
             drop(queue);
@@ -222,32 +226,81 @@ impl Semaphore {
         self.available_permits.load(atomic::Ordering::Acquire)
     }
 
+    /// Increase the number of permits by `n`.
+    ///
+    /// Cancels pending reductions first, then wakes queued waiters, then adds to the available
+    /// pool.
     pub fn add_permits(self: Arc<Self>, n: usize) {
-        // Wake up to n queued waiters, then add any remaining to available_permits.
+        let mut to_add = n;
+
+        // Cancel pending reductions before giving permits to waiters or the pool.
+        let mut pending = self.priority_reduction.load(atomic::Ordering::Acquire);
+        while pending > 0 && to_add > 0 {
+            let to_cancel = to_add.min(pending);
+            match self.priority_reduction.compare_exchange(
+                pending,
+                pending - to_cancel,
+                atomic::Ordering::AcqRel,
+                atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    to_add -= to_cancel;
+                    pending -= to_cancel;
+                }
+                Err(v) => pending = v,
+            }
+        }
+
+        if to_add == 0 {
+            return;
+        }
+
+        // Wake up to to_add queued waiters, then add any remaining to available_permits.
         let mut queue = self.queue.lock().expect("lock should not be poisoned");
-        let to_wake = n.min(queue.len());
+        let to_wake = to_add.min(queue.len());
         for _ in 0..to_wake {
             let entry = queue.pop_front().expect("just checked len");
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
             }));
         }
-        let remaining = n - to_wake;
+        let remaining = to_add - to_wake;
         if remaining > 0 {
             self.available_permits
                 .fetch_add(remaining, atomic::Ordering::Release);
         }
     }
 
-    pub async fn acquire_many(self: Arc<Self>, n: u32) -> Result<Vec<Permit>, AcquireError> {
-        let mut permits = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            let permit = Arc::clone(&self)
-                .acquire_timeout(std::time::Duration::MAX)
-                .await?;
-            permits.push(permit);
+    /// Decrease the number of permits by `n`.
+    ///
+    /// Consumes available permits immediately; any remainder is recorded in [`priority_reduction`]
+    /// and consumed as in-flight permits are returned, taking priority over queued waiters.
+    pub fn decrease_permits(&self, n: usize) {
+        let mut remaining = n;
+
+        // Immediately consume as many available permits as possible.
+        let mut available = self.available_permits.load(atomic::Ordering::Acquire);
+        while remaining > 0 && available > 0 {
+            let to_take = remaining.min(available);
+            match self.available_permits.compare_exchange(
+                available,
+                available - to_take,
+                atomic::Ordering::AcqRel,
+                atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    remaining -= to_take;
+                    available -= to_take;
+                }
+                Err(v) => available = v,
+            }
         }
-        Ok(permits)
+
+        // Schedule the rest to be consumed as in-flight permits are returned.
+        if remaining > 0 {
+            self.priority_reduction
+                .fetch_add(remaining, atomic::Ordering::Release);
+        }
     }
 
     fn cancel(&self, id: EntryId) {
@@ -308,15 +361,6 @@ impl Future for Acquire {
 impl Drop for Acquire {
     fn drop(&mut self) {
         self.semaphore.cancel(self.id);
-    }
-}
-
-impl Permit {
-    /// Forget the permit without returning it to the semaphore.
-    ///
-    /// This permanently removes a permit from the pool, reducing the effective limit by 1.
-    pub fn forget(mut self) {
-        self.semaphore = None;
     }
 }
 
@@ -623,9 +667,9 @@ mod tests {
         assert!(waiter.await.unwrap().is_ok());
     }
 
-    /// Forgetting a permit permanently removes it from the pool.
+    /// Returning an in-flight permit satisfies `priority_reduction`, shrinking the pool.
     #[tokio::test]
-    async fn forget_reduces_pool_size() {
+    async fn decrease_permits_consumed_as_in_flight_return() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .max_permits(3)
@@ -633,73 +677,30 @@ mod tests {
                 .build(),
         );
 
-        assert_eq!(semaphore.available_permits(), 3);
-
-        let p = semaphore.clone().try_acquire().unwrap();
-        p.forget();
-
-        assert_eq!(semaphore.available_permits(), 2);
-
-        // Confirm the remaining permits still work normally
-        let p2 = semaphore.clone().try_acquire().unwrap();
-        drop(p2);
-        assert_eq!(semaphore.available_permits(), 2);
-    }
-
-    /// `acquire_many` acquires exactly n permits.
-    #[tokio::test]
-    async fn acquire_many_acquires_n_permits() {
-        let semaphore = Arc::new(
-            Semaphore::builder()
-                .max_permits(5)
-                .max_queue_size(0)
-                .build(),
-        );
-
-        let permits = semaphore.clone().acquire_many(3).await.unwrap();
-        assert_eq!(permits.len(), 3);
-        assert_eq!(semaphore.available_permits(), 2);
-
-        drop(permits);
-        assert_eq!(semaphore.available_permits(), 5);
-    }
-
-    /// `acquire_many` blocks until all permits are available.
-    #[tokio::test(start_paused = true)]
-    async fn acquire_many_waits_for_permits() {
-        let semaphore = Arc::new(
-            Semaphore::builder()
-                .max_permits(2)
-                .max_queue_size(3)
-                .build(),
-        );
-
-        // Hold both permits
         let p1 = semaphore.clone().try_acquire().unwrap();
         let p2 = semaphore.clone().try_acquire().unwrap();
+        // 1 available, 2 in-flight
 
-        let done = Arc::new(Mutex::new(false));
-        let task = tokio::spawn({
-            let semaphore = semaphore.clone();
-            let done = done.clone();
-            async move {
-                let permits = semaphore.acquire_many(2).await.unwrap();
-                *done.lock().unwrap() = true;
-                permits
-            }
-        });
+        semaphore.decrease_permits(3); // consume 1 available immediately, 2 pending
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            2
+        );
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!*done.lock().unwrap(), "should still be waiting");
+        drop(p1); // satisfies 1 pending reduction
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            1
+        );
+        assert_eq!(semaphore.available_permits(), 0);
 
-        drop(p1);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!*done.lock().unwrap(), "still waiting for second permit");
-
-        drop(p2);
-        let permits = task.await.unwrap();
-        assert!(*done.lock().unwrap());
-        assert_eq!(permits.len(), 2);
+        drop(p2); // satisfies the last pending reduction
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(semaphore.available_permits(), 0); // pool is now size 0
     }
 
     /// Waiters are served in FIFO order.
@@ -741,5 +742,143 @@ mod tests {
         w3.await.unwrap();
 
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// `decrease_permits` immediately consumes available permits.
+    #[tokio::test]
+    async fn decrease_permits_consumes_available_immediately() {
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(5)
+                .max_queue_size(0)
+                .build(),
+        );
+
+        semaphore.decrease_permits(3);
+
+        assert_eq!(semaphore.available_permits(), 2);
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            0,
+            "no pending reduction when permits were available"
+        );
+    }
+
+    /// `decrease_permits` records the remainder in `priority_reduction` when not enough permits
+    /// are immediately available.
+    #[tokio::test]
+    async fn decrease_permits_sets_priority_reduction_for_remainder() {
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(3)
+                .max_queue_size(0)
+                .build(),
+        );
+
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p2 = semaphore.clone().try_acquire().unwrap();
+        // 1 available, 2 in-flight
+
+        semaphore.decrease_permits(4); // want to take 4, only 1 available
+
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            3
+        );
+    }
+
+    /// Returning a permit satisfies `priority_reduction` before waking a queued waiter.
+    #[tokio::test(start_paused = true)]
+    async fn return_permit_satisfies_priority_reduction_before_queue() {
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(1)
+                .max_queue_size(1)
+                .build(),
+        );
+
+        let p1 = semaphore.clone().try_acquire().unwrap();
+
+        // A waiter joins the queue
+        let waiter = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(semaphore.queue.lock().unwrap().len(), 1);
+
+        // Record a priority reduction
+        semaphore
+            .priority_reduction
+            .store(1, atomic::Ordering::Release);
+
+        // Return the permit: the reduction should consume it, not the waiter
+        drop(p1);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            0,
+            "reduction should be satisfied"
+        );
+        assert_eq!(
+            semaphore.queue.lock().unwrap().len(),
+            1,
+            "waiter should still be in queue"
+        );
+
+        // Clean up: the waiter will never get a permit, abort it
+        waiter.abort();
+        tokio::task::yield_now().await;
+    }
+
+    /// `add_permits` cancels pending reductions rather than giving permits to waiters or the pool.
+    #[tokio::test(start_paused = true)]
+    async fn add_permits_cancels_pending_reductions() {
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .max_permits(4)
+                .max_queue_size(2)
+                .build(),
+        );
+
+        // Hold all 4 permits
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p2 = semaphore.clone().try_acquire().unwrap();
+        let _p3 = semaphore.clone().try_acquire().unwrap();
+        let _p4 = semaphore.clone().try_acquire().unwrap();
+
+        // Record 3 pending reductions (e.g. from a limit decrease)
+        semaphore.decrease_permits(3);
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            3
+        );
+
+        // Queue up a waiter
+        let waiter = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Add 2 permits: should cancel 2 reductions, not wake the waiter
+        semaphore.clone().add_permits(2);
+
+        assert_eq!(
+            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            1,
+            "2 of 3 reductions should be cancelled"
+        );
+        assert_eq!(semaphore.available_permits(), 0, "no permits added to pool");
+        assert_eq!(
+            semaphore.queue.lock().unwrap().len(),
+            1,
+            "waiter should not have been woken"
+        );
+
+        waiter.abort();
+        tokio::task::yield_now().await;
     }
 }

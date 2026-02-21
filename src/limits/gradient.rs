@@ -174,7 +174,7 @@ mod tests {
         static INIT_LIMIT: usize = 10;
         let gradient = Gradient::new_with_initial_limit(INIT_LIMIT);
 
-        let limiter = Limiter::new(gradient);
+        let limiter = Limiter::builder().limit_algo(gradient).build();
 
         /*
          * Concurrency = 10

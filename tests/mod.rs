@@ -546,12 +546,16 @@ async fn test() {
     let simulation_duration = Duration::from_secs(1);
 
     let client = Client::with_rps(
-        Some(Limiter::new(LimitWrapper::Aimd(
-            Aimd::new_with_initial_limit(10)
-                .with_max_limit(20)
-                .decrease_factor(0.9)
-                .increase_by(1),
-        ))),
+        Some(
+            Limiter::builder()
+                .limit_algo(LimitWrapper::Aimd(
+                    Aimd::new_with_initial_limit(10)
+                        .with_max_limit(20)
+                        .decrease_factor(0.9)
+                        .increase_by(1),
+                ))
+                .build(),
+        ),
         100.0,
     );
 

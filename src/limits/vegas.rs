@@ -248,7 +248,7 @@ mod tests {
         static INIT_LIMIT: usize = 10;
         let vegas = Vegas::new_with_initial_limit(INIT_LIMIT);
 
-        let limiter = Limiter::new(vegas);
+        let limiter = Limiter::builder().limit_algo(vegas).build();
 
         /*
          * Warm up
@@ -318,7 +318,7 @@ mod tests {
         .with_min_window(Duration::ZERO)
         .with_max_window(Duration::ZERO);
 
-        let limiter = Limiter::new(vegas);
+        let limiter = Limiter::builder().limit_algo(vegas).build();
 
         let mut next_tokens = VecDeque::with_capacity(9);
 
