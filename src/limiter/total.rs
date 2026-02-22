@@ -68,7 +68,6 @@ where
         self.semaphore.available_permits()
     }
 
-
     pub(crate) fn limit(&self) -> CapacityUnit {
         self.limit.load(atomic::Ordering::Acquire)
     }
@@ -143,7 +142,8 @@ where
                     n.notify_one();
                 }
             }
-            _ => {
+            _ =>
+            {
                 #[cfg(test)]
                 if let Some(n) = &self.notifier {
                     n.notify_one();

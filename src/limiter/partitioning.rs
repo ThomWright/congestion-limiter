@@ -177,11 +177,7 @@ where
         }
     }
 
-    async fn acquire_timeout(
-        &self,
-        duration: Duration,
-        index: StateIndex,
-    ) -> Option<Permit> {
+    async fn acquire_timeout(&self, duration: Duration, index: StateIndex) -> Option<Permit> {
         let partition = self
             .partition_states
             .get(index)

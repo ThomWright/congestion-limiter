@@ -189,7 +189,9 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let limiter = Limiter::builder().limit_algo(Arc::clone(&mock_algo)).build();
+        let limiter = Limiter::builder()
+            .limit_algo(Arc::clone(&mock_algo))
+            .build();
 
         let mut token = limiter.try_acquire().unwrap();
 

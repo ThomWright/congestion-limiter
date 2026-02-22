@@ -73,7 +73,8 @@ mod tests {
 
         let delay = Duration::from_millis(5000);
 
-        let limiter = RejectionDelay::new(delay, Limiter::builder().limit_algo(Fixed::new(1)).build());
+        let limiter =
+            RejectionDelay::new(delay, Limiter::builder().limit_algo(Fixed::new(1)).build());
 
         let _token = limiter.try_acquire().await.unwrap();
 
@@ -90,7 +91,8 @@ mod tests {
 
         let delay = Duration::from_millis(5000);
 
-        let limiter = RejectionDelay::new(delay, Limiter::builder().limit_algo(Fixed::new(1)).build());
+        let limiter =
+            RejectionDelay::new(delay, Limiter::builder().limit_algo(Fixed::new(1)).build());
 
         let _token = limiter.try_acquire().await.unwrap();
 
