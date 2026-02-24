@@ -291,31 +291,50 @@ where
 
         let scheduler = Arc::clone(self);
         tokio::spawn(async move {
-            let mut highest_priority = 0.0;
-            let mut locked_queue = None;
+            // Loop to skip over stale entries (receivers dropped due to timeout).
+            //
+            // Each iteration does a full O(p) scan over partitions to find the highest-priority
+            // waiter, then attempts to send. If the receiver was dropped, we retry with the next
+            // highest-priority entry.
+            //
+            // Worst case O(p*j): if every queued entry across all p partitions is stale, we do
+            // one full scan per stale entry j. Proper cancellation on timeout (removing entries
+            // from the queue when the caller drops) would reduce this to O(p).
+            let mut permit = permit;
+            loop {
+                let mut highest_priority = 0.0;
+                let mut locked_queue = None;
 
-            // Iterate through all partitions to find the job with the highest priority.
-            // The item at the front of each queue has the highest priority for that partition.
-            // O(n) where n is the number of partitions.
-            for p in scheduler.partition_states.iter() {
-                let q = match p.job_queue.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if let Some((instant, _tx)) = q.front() {
-                    let job_priority = priority(p.fraction, instant.elapsed());
-                    if job_priority > highest_priority {
-                        highest_priority = job_priority;
-                        locked_queue = Some(q);
+                // Iterate through all partitions to find the job with the highest priority.
+                // The item at the front of each queue has the highest priority for that partition.
+                for p in scheduler.partition_states.iter() {
+                    let q = match p.job_queue.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some((instant, _tx)) = q.front() {
+                        let job_priority = priority(p.fraction, instant.elapsed());
+                        if job_priority > highest_priority {
+                            highest_priority = job_priority;
+                            locked_queue = Some(q);
+                        }
                     }
                 }
-            }
 
-            if let Some(mut queue) = locked_queue {
-                let (_, tx) = queue.pop_front().unwrap();
-                let _ = tx.send(permit);
-            } else {
-                drop(permit);
+                match locked_queue {
+                    Some(mut queue) => {
+                        let (_, tx) = queue.pop_front().unwrap();
+                        drop(queue);
+                        match tx.send(permit) {
+                            Ok(()) => break,
+                            Err(p) => permit = p, // stale entry: retry with next waiter
+                        }
+                    }
+                    None => {
+                        scheduler.total_limiter.release(permit);
+                        break;
+                    }
+                }
             }
         });
     }
@@ -558,6 +577,82 @@ mod tests {
         queueing_task.await.expect("task should not panic");
 
         assert!(t.lock().unwrap().is_some(), "should acquire the token");
+    }
+
+    #[tokio::test]
+    async fn in_flight_is_decremented_after_release() {
+        let mock_algo = Arc::new(MockLimitAlgorithm::default());
+        mock_algo.set_limit(10);
+
+        let partitions = PartitionedLimiter::builder()
+            .limit_algo(Arc::clone(&mock_algo))
+            .weights(vec![1.0])
+            .build();
+
+        let t1 = partitions[0].try_acquire().unwrap();
+        t1.set_outcome(Outcome::Success).await;
+
+        // The permit recycling is async in a new task
+        tokio::task::yield_now().await;
+
+        let t2 = partitions[0].try_acquire().unwrap();
+        t2.set_outcome(Outcome::Success).await;
+
+        let samples = mock_algo.samples().await;
+        assert_eq!(samples[0].in_flight, 1, "first sample");
+        assert_eq!(samples[1].in_flight, 1, "second sample: should not grow");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_queue_entries_are_skipped() {
+        let mock_algo = Arc::new(MockLimitAlgorithm::default());
+        mock_algo.set_limit(1);
+
+        let partitions = PartitionedLimiter::builder()
+            .limit_algo(Arc::clone(&mock_algo))
+            .weights(vec![1.0])
+            .build();
+
+        // Acquire the only permit.
+        let t0 = partitions[0].try_acquire().unwrap();
+
+        // Queue waiter1 with a short timeout. It will expire, leaving a stale tx in the queue.
+        let waiter1 = tokio::spawn({
+            let p = Arc::clone(&partitions[0]);
+            async move { p.acquire_timeout(Duration::from_millis(10)).await }
+        });
+
+        // Let waiter1 enter the queue before advancing time.
+        tokio::task::yield_now().await;
+
+        // Advance time slightly so waiter2 records a later queue timestamp (lower priority).
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        // Queue waiter2 with a long timeout.
+        let waiter2 = tokio::spawn({
+            let p = Arc::clone(&partitions[0]);
+            async move { p.acquire_timeout(Duration::MAX).await.is_some() }
+        });
+
+        // Let waiter2 enter the queue.
+        tokio::task::yield_now().await;
+
+        // Advance time past waiter1's timeout (10ms), expiring it.
+        tokio::time::advance(Duration::from_millis(20)).await;
+
+        // Await waiter1 to confirm it timed out (and its rx is now dropped).
+        let result1 = waiter1.await.unwrap();
+        assert!(result1.is_none(), "waiter1 should have timed out");
+
+        // Release the permit.
+        drop(t0);
+
+        // Let recycle_permit's spawn run.
+        tokio::task::yield_now().await;
+
+        // waiter2 should receive the permit despite the stale entry.
+        let got_permit = waiter2.await.unwrap();
+        assert!(got_permit, "waiter2 should receive the permit");
     }
 
     // TODO: test fairness
