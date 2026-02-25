@@ -99,6 +99,7 @@ impl Semaphore {
         let cap_per_queue = max_queue_size.min(64);
         Self {
             available_permits: AtomicUsize::new(initial_permits),
+            total_max_queue_size: max_queue_size * weights.len(),
             queues: Mutex::new(
                 weights
                     .into_iter()
@@ -108,7 +109,6 @@ impl Semaphore {
                     })
                     .collect(),
             ),
-            total_max_queue_size: max_queue_size,
             priority_reduction: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         }
