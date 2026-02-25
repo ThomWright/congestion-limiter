@@ -8,6 +8,7 @@
 //! This won't be as optimised as tokio's semaphore, but it should be good enough for our use case.
 
 use std::{
+    cmp::Ordering,
     collections::VecDeque,
     future::Future,
     sync::{
@@ -20,10 +21,16 @@ use bon::bon;
 use tokio::{sync::oneshot, time::Instant};
 
 #[derive(Debug)]
+struct WeightedSubQueue {
+    weight: f64,
+    entries: VecDeque<QueueEntry>,
+}
+
+#[derive(Debug)]
 pub struct Semaphore {
     available_permits: AtomicUsize,
-    queue: Mutex<VecDeque<QueueEntry>>,
-    max_queue_size: usize,
+    queues: Mutex<Vec<WeightedSubQueue>>,
+    total_max_queue_size: usize,
     /// Number of returning permits to silently consume rather than return to the pool or wake a
     /// waiter. Checked before the queue in [`Semaphore::return_permit`], so these take priority
     /// over queued waiters.
@@ -31,6 +38,7 @@ pub struct Semaphore {
     // The tokio implementation has a nice optimisation where the closed state is a bitmask over
     // `available_permits` (a few bits are reserved for flags), so it can load the complete state
     // atomically.
+    // TODO: would this be useful for us?
     closed: AtomicBool,
 }
 
@@ -56,6 +64,7 @@ pub struct Permit {
 
 struct Acquire {
     id: EntryId,
+    queue_idx: usize,
     receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
     semaphore: Arc<Semaphore>,
 }
@@ -75,11 +84,31 @@ pub enum AcquireError {
 #[bon]
 impl Semaphore {
     #[builder]
-    pub fn new(max_permits: usize, max_queue_size: usize) -> Self {
+    pub fn new(
+        /// Initial number of permits in the pool.
+        initial_permits: usize,
+        /// Maximum queue size for each sub-queue. The total max queue size is `max_queue_size * weights.len()`.
+        max_queue_size: usize,
+        /// Weights for each sub-queue. Defaults to `[1.0]`.
+        #[builder(default = vec![1.0])]
+        weights: Vec<f64>,
+    ) -> Self {
+        assert!(!weights.is_empty(), "weights must not be empty");
+
+        // Avoid unbounded memory usage for very large max_queue_size.
+        let cap_per_queue = max_queue_size.min(64);
         Self {
-            available_permits: AtomicUsize::new(max_permits),
-            queue: Mutex::new(VecDeque::with_capacity(max_queue_size.min(64))),
-            max_queue_size,
+            available_permits: AtomicUsize::new(initial_permits),
+            queues: Mutex::new(
+                weights
+                    .into_iter()
+                    .map(|w| WeightedSubQueue {
+                        weight: w,
+                        entries: VecDeque::with_capacity(cap_per_queue),
+                    })
+                    .collect(),
+            ),
+            total_max_queue_size: max_queue_size,
             priority_reduction: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         }
@@ -112,9 +141,10 @@ impl Semaphore {
         }
     }
 
-    pub async fn acquire_timeout(
+    pub(crate) async fn acquire_timeout(
         self: Arc<Self>,
         timeout: std::time::Duration,
+        queue_idx: usize,
     ) -> Result<Permit, AcquireError> {
         let mut available_permits = self.available_permits.load(atomic::Ordering::Acquire);
         loop {
@@ -123,10 +153,10 @@ impl Semaphore {
             }
             if available_permits == 0 {
                 let (receiver, id) = {
-                    let mut queue = self.queue.lock().expect("lock should not be poisoned");
+                    let mut queues = self.queues.lock().expect("lock should not be poisoned");
 
                     // Re-check under the lock: a concurrent return_permit may have incremented
-                    // available_permits after our load but before we locked the queue. If so,
+                    // available_permits after our load but before we locked the queues. If so,
                     // grab the permit directly without queuing.
                     let mut current = self.available_permits.load(atomic::Ordering::Acquire);
                     loop {
@@ -148,22 +178,24 @@ impl Semaphore {
                         }
                     }
 
-                    if queue.len() >= self.max_queue_size {
+                    let total_len: usize = queues.iter().map(|q| q.entries.len()).sum();
+                    if total_len >= self.total_max_queue_size {
                         return Err(AcquireError::QueueFull);
                     }
                     let (sender, receiver) = oneshot::channel();
 
-                    let id = match queue.back() {
+                    let sub = &mut queues[queue_idx];
+                    let id = match sub.entries.back() {
                         Some(entry) => entry.id.next(),
                         _ => EntryId::default(),
                     };
-                    queue.push_back(QueueEntry { id, sender });
-                    drop(queue);
+                    sub.entries.push_back(QueueEntry { id, sender });
+                    drop(queues);
 
                     (receiver, id)
                 };
 
-                let acquire = Acquire::new(Arc::clone(&self), receiver, id);
+                let acquire = Acquire::new(Arc::clone(&self), receiver, id, queue_idx);
                 match tokio::time::timeout(timeout, acquire).await {
                     Ok(Ok(permit)) => {
                         return Ok(permit);
@@ -194,6 +226,26 @@ impl Semaphore {
         }
     }
 
+    /// Dequeue the highest-priority entry across all sub-queues.
+    ///
+    /// Priority = `weight * time_in_queue`. Scans the front of each sub-queue (O(p)) and pops
+    /// from the winner. FIFO tiebreak: older entry (lower `EntryId`) wins.
+    fn dequeue_highest_priority(queues: &mut [WeightedSubQueue]) -> Option<QueueEntry> {
+        let best_idx = queues
+            .iter()
+            .enumerate()
+            .filter_map(|(qi, sub)| sub.entries.front().map(|e| (qi, sub.weight, e)))
+            .max_by(|(_, wa, a), (_, wb, b)| {
+                let pa = wa * a.id.added.elapsed().as_secs_f64();
+                let pb = wb * b.id.added.elapsed().as_secs_f64();
+                pa.partial_cmp(&pb)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| b.id.cmp(&a.id)) // FIFO tiebreak: lower id = older = wins
+            })
+            .map(|(qi, _, _)| qi)?;
+        queues[best_idx].entries.pop_front()
+    }
+
     fn return_permit(self: Arc<Self>) {
         // Priority: satisfy pending reductions before waking queued waiters.
         let mut pending = self.priority_reduction.load(atomic::Ordering::Acquire);
@@ -209,9 +261,9 @@ impl Semaphore {
             }
         }
 
-        let mut queue = self.queue.lock().expect("lock should not be poisoned");
-        if let Some(entry) = queue.pop_front() {
-            drop(queue);
+        let mut queues = self.queues.lock().expect("lock should not be poisoned");
+        if let Some(entry) = Self::dequeue_highest_priority(&mut queues) {
+            drop(queues);
 
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
@@ -256,10 +308,12 @@ impl Semaphore {
         }
 
         // Wake up to to_add queued waiters, then add any remaining to available_permits.
-        let mut queue = self.queue.lock().expect("lock should not be poisoned");
-        let to_wake = to_add.min(queue.len());
+        let mut queues = self.queues.lock().expect("lock should not be poisoned");
+        let total_len: usize = queues.iter().map(|q| q.entries.len()).sum();
+        let to_wake = to_add.min(total_len);
         for _ in 0..to_wake {
-            let entry = queue.pop_front().expect("just checked len");
+            let entry = Self::dequeue_highest_priority(&mut queues)
+                .expect("total_len > 0 implies at least one sub-queue has an entry");
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
             }));
@@ -303,20 +357,22 @@ impl Semaphore {
         }
     }
 
-    fn cancel(&self, id: EntryId) {
-        let mut queue = self.queue.lock().expect("lock should not be poisoned");
-        if let Ok(index) = queue.binary_search_by_key(&id, |entry| entry.id) {
-            queue.remove(index);
-            drop(queue);
+    fn cancel(&self, id: EntryId, queue_idx: usize) {
+        let mut queues = self.queues.lock().expect("lock should not be poisoned");
+        let entries = &mut queues[queue_idx].entries;
+        if let Ok(index) = entries.binary_search_by_key(&id, |entry| entry.id) {
+            entries.remove(index);
         }
     }
 
     fn close(&self) {
         self.closed.store(true, atomic::Ordering::Release);
 
-        let mut queue = self.queue.lock().expect("lock should not be poisoned");
-        for entry in queue.drain(..) {
-            let _ = entry.sender.send(Err(AcquireError::Closed));
+        let mut queues = self.queues.lock().expect("lock should not be poisoned");
+        for sub in queues.iter_mut() {
+            for entry in sub.entries.drain(..) {
+                let _ = entry.sender.send(Err(AcquireError::Closed));
+            }
         }
     }
 }
@@ -332,9 +388,11 @@ impl Acquire {
         semaphore: Arc<Semaphore>,
         receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
         id: EntryId,
+        queue_idx: usize,
     ) -> Self {
         Self {
             id,
+            queue_idx,
             receiver,
             semaphore,
         }
@@ -360,7 +418,7 @@ impl Future for Acquire {
 
 impl Drop for Acquire {
     fn drop(&mut self) {
-        self.semaphore.cancel(self.id);
+        self.semaphore.cancel(self.id, self.queue_idx);
     }
 }
 
@@ -402,11 +460,21 @@ mod tests {
 
     use super::*;
 
+    fn queue_len(semaphore: &Semaphore) -> usize {
+        semaphore
+            .queues
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|q| q.entries.len())
+            .sum()
+    }
+
     #[tokio::test]
     async fn try_acquire() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -425,7 +493,7 @@ mod tests {
     async fn acquire_timeout() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -435,7 +503,7 @@ mod tests {
             let acquired = acquired.clone();
             let semaphore = semaphore.clone();
             async move {
-                let p2 = semaphore.acquire_timeout(Duration::from_secs(2)).await;
+                let p2 = semaphore.acquire_timeout(Duration::from_secs(2), 0).await;
                 let mut a = acquired.lock().unwrap();
                 *a = true;
                 p2
@@ -452,7 +520,7 @@ mod tests {
     async fn acquire_timeout_times_out() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -462,7 +530,7 @@ mod tests {
             let semaphore = semaphore.clone();
             async move {
                 // Try to acquire another permit
-                semaphore.acquire_timeout(Duration::from_secs(2)).await
+                semaphore.acquire_timeout(Duration::from_secs(2), 0).await
             }
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -476,7 +544,7 @@ mod tests {
     async fn acquire_timeout_removes_from_queue_when_dropped() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(2)
                 .build(),
         );
@@ -487,29 +555,29 @@ mod tests {
         // Queue up two acquires
         let acquire_task1 = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::from_secs(1)).await }
+            async move { semaphore.acquire_timeout(Duration::from_secs(1), 0).await }
         });
         let acquire_task2 = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
 
         // Wait for the first acquire to time out
         let res = acquire_task1.await.unwrap();
         assert_matches!(res, Err(AcquireError::Timeout));
-        assert_eq!(semaphore.queue.lock().unwrap().len(), 1);
+        assert_eq!(queue_len(&semaphore), 1);
 
         // Abort the second acquire
         acquire_task2.abort();
         tokio::task::yield_now().await;
-        assert_eq!(semaphore.queue.lock().unwrap().len(), 0);
+        assert_eq!(queue_len(&semaphore), 0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_errors_when_semaphore_closed() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -517,7 +585,7 @@ mod tests {
         let _p1 = semaphore.clone().try_acquire().unwrap();
         let acquire_task = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::from_secs(1)).await }
+            async move { semaphore.acquire_timeout(Duration::from_secs(1), 0).await }
         });
 
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -531,7 +599,7 @@ mod tests {
     async fn acquire_errs_when_closed() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -540,7 +608,7 @@ mod tests {
         let res = semaphore.clone().try_acquire();
         assert_matches!(res, Err(AcquireError::Closed));
 
-        let res = semaphore.acquire_timeout(Duration::from_secs(1)).await;
+        let res = semaphore.acquire_timeout(Duration::from_secs(1), 0).await;
         assert_matches!(res, Err(AcquireError::Closed));
     }
 
@@ -550,7 +618,7 @@ mod tests {
     async fn queued_acquire_does_not_double_return_permit() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -560,7 +628,7 @@ mod tests {
         // Queue up a waiter
         let waiter = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await.unwrap() }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await.unwrap() }
         });
 
         // Release p1; the waiter should receive the permit
@@ -580,7 +648,7 @@ mod tests {
     async fn queue_full_error() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -589,13 +657,13 @@ mod tests {
         // First waiter fills the queue
         let _waiter = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
         // Yield so the waiter actually enters the queue
         tokio::task::yield_now().await;
 
         // Second waiter should be rejected
-        let res = semaphore.clone().acquire_timeout(Duration::ZERO).await;
+        let res = semaphore.clone().acquire_timeout(Duration::ZERO, 0).await;
         assert_matches!(res, Err(AcquireError::QueueFull));
     }
 
@@ -604,7 +672,7 @@ mod tests {
     async fn add_permits_wakes_waiters() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(3)
                 .build(),
         );
@@ -615,14 +683,14 @@ mod tests {
         // Queue up 2 waiters
         let waiter1 = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
         let waiter2 = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
         tokio::task::yield_now().await;
-        assert_eq!(semaphore.queue.lock().unwrap().len(), 2);
+        assert_eq!(queue_len(&semaphore), 2);
 
         // Add 2 permits: both waiters should be woken, nothing left in available.
         semaphore.clone().add_permits(2);
@@ -631,7 +699,7 @@ mod tests {
         // Check while tasks still hold their permits (before awaiting them, which drops the
         // permits and returns them to the pool).
         assert_eq!(semaphore.available_permits(), 0);
-        assert_eq!(semaphore.queue.lock().unwrap().len(), 0);
+        assert_eq!(queue_len(&semaphore), 0);
 
         assert!(waiter1.await.unwrap().is_ok());
         assert!(waiter2.await.unwrap().is_ok());
@@ -642,7 +710,7 @@ mod tests {
     async fn add_permits_surplus_goes_to_available() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(2)
+                .initial_permits(2)
                 .max_queue_size(1)
                 .build(),
         );
@@ -654,7 +722,7 @@ mod tests {
         // Queue up 1 waiter
         let waiter = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
         tokio::task::yield_now().await;
 
@@ -672,7 +740,7 @@ mod tests {
     async fn decrease_permits_consumed_as_in_flight_return() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(3)
+                .initial_permits(3)
                 .max_queue_size(0)
                 .build(),
         );
@@ -708,7 +776,7 @@ mod tests {
     async fn fifo_ordering() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(3)
                 .build(),
         );
@@ -721,7 +789,7 @@ mod tests {
             let semaphore = semaphore.clone();
             let order = order.clone();
             tokio::spawn(async move {
-                let _p = semaphore.acquire_timeout(Duration::MAX).await.unwrap();
+                let _p = semaphore.acquire_timeout(Duration::MAX, 0).await.unwrap();
                 order.lock().unwrap().push(n);
                 // _p dropped here: wakes the next waiter in the queue
             })
@@ -733,7 +801,7 @@ mod tests {
 
         // Let all waiters enter the queue
         tokio::task::yield_now().await;
-        assert_eq!(semaphore.queue.lock().unwrap().len(), 3);
+        assert_eq!(queue_len(&semaphore), 3);
 
         // Releasing p1 wakes w1; each task drops its permit on exit, waking the next.
         drop(p1);
@@ -749,7 +817,7 @@ mod tests {
     async fn decrease_permits_consumes_available_immediately() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(5)
+                .initial_permits(5)
                 .max_queue_size(0)
                 .build(),
         );
@@ -770,7 +838,7 @@ mod tests {
     async fn decrease_permits_sets_priority_reduction_for_remainder() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(3)
+                .initial_permits(3)
                 .max_queue_size(0)
                 .build(),
         );
@@ -793,7 +861,7 @@ mod tests {
     async fn return_permit_satisfies_priority_reduction_before_queue() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(1)
+                .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
         );
@@ -803,10 +871,10 @@ mod tests {
         // A waiter joins the queue
         let waiter = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
         tokio::task::yield_now().await;
-        assert_eq!(semaphore.queue.lock().unwrap().len(), 1);
+        assert_eq!(queue_len(&semaphore), 1);
 
         // Record a priority reduction
         semaphore
@@ -822,11 +890,7 @@ mod tests {
             0,
             "reduction should be satisfied"
         );
-        assert_eq!(
-            semaphore.queue.lock().unwrap().len(),
-            1,
-            "waiter should still be in queue"
-        );
+        assert_eq!(queue_len(&semaphore), 1, "waiter should still be in queue");
 
         // Clean up: the waiter will never get a permit, abort it
         waiter.abort();
@@ -838,7 +902,7 @@ mod tests {
     async fn add_permits_cancels_pending_reductions() {
         let semaphore = Arc::new(
             Semaphore::builder()
-                .max_permits(4)
+                .initial_permits(4)
                 .max_queue_size(2)
                 .build(),
         );
@@ -859,7 +923,7 @@ mod tests {
         // Queue up a waiter
         let waiter = tokio::spawn({
             let semaphore = semaphore.clone();
-            async move { semaphore.acquire_timeout(Duration::MAX).await }
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
         });
         tokio::task::yield_now().await;
 
@@ -873,12 +937,105 @@ mod tests {
         );
         assert_eq!(semaphore.available_permits(), 0, "no permits added to pool");
         assert_eq!(
-            semaphore.queue.lock().unwrap().len(),
+            queue_len(&semaphore),
             1,
             "waiter should not have been woken"
         );
 
         waiter.abort();
         tokio::task::yield_now().await;
+    }
+
+    /// With two sub-queues of different weights, the higher-weight waiter is served first even
+    /// when the lower-weight waiter has been in the queue longer.
+    #[tokio::test(start_paused = true)]
+    async fn priority_ordering() {
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .initial_permits(1)
+                .max_queue_size(2)
+                .weights(vec![1.0, 10.0])
+                .build(),
+        );
+
+        let p1 = semaphore.clone().try_acquire().unwrap();
+
+        let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Queue a waiter in sub-queue 0 (weight 1.0).
+        let w0 = tokio::spawn({
+            let semaphore = semaphore.clone();
+            let order = order.clone();
+            async move {
+                let _p = semaphore.acquire_timeout(Duration::MAX, 0).await.unwrap();
+                order.lock().unwrap().push(0u32);
+                // _p dropped here, waking the next waiter
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // Advance so w0 has been waiting 5ms.
+        tokio::time::advance(Duration::from_millis(5)).await;
+
+        // Queue a waiter in sub-queue 1 (weight 10.0).
+        let w1 = tokio::spawn({
+            let semaphore = semaphore.clone();
+            let order = order.clone();
+            async move {
+                let _p = semaphore.acquire_timeout(Duration::MAX, 1).await.unwrap();
+                order.lock().unwrap().push(1u32);
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // Advance another 5ms. Now:
+        //   sub-queue 0: weight=1.0,  waited=10ms → priority = 0.010
+        //   sub-queue 1: weight=10.0, waited=5ms  → priority = 0.050  ← wins
+        tokio::time::advance(Duration::from_millis(5)).await;
+
+        drop(p1);
+        w1.await.unwrap();
+        w0.await.unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec![1, 0]);
+    }
+
+    /// Timing out in a non-default sub-queue removes the entry from the correct sub-queue and
+    /// leaves other sub-queues untouched.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_targets_correct_sub_queue() {
+        let semaphore = Arc::new(
+            Semaphore::builder()
+                .initial_permits(1)
+                .max_queue_size(2)
+                .weights(vec![1.0, 1.0])
+                .build(),
+        );
+
+        let _p1 = semaphore.clone().try_acquire().unwrap();
+
+        // Queue a waiter in sub-queue 0 — should survive.
+        let w0 = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::MAX, 0).await }
+        });
+
+        // Queue a waiter in sub-queue 1 with a short timeout — should be cancelled.
+        let w1 = tokio::spawn({
+            let semaphore = semaphore.clone();
+            async move { semaphore.acquire_timeout(Duration::from_secs(1), 1).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(queue_len(&semaphore), 2);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_matches!(w1.await.unwrap(), Err(AcquireError::Timeout));
+
+        // w1's entry should be gone; w0's entry in sub-queue 0 is untouched.
+        assert_eq!(queue_len(&semaphore), 1);
+
+        w0.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(queue_len(&semaphore), 0);
     }
 }

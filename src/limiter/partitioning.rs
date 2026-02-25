@@ -1,16 +1,11 @@
 use std::{
-    collections::VecDeque,
     fmt::Debug,
-    sync::{atomic, Arc, Mutex},
+    sync::{atomic, Arc},
     time::Duration,
 };
 
 use bon::bon;
 use conv::{ConvAsUtil, ConvUtil};
-use tokio::{
-    sync::oneshot,
-    time::{timeout, Instant},
-};
 
 use crate::semaphore::Permit;
 
@@ -46,9 +41,6 @@ struct PartitionState {
     /// Normalised, sum of fractions = 1.
     fraction: f64,
     in_flight: AtomicCapacityUnit,
-
-    // TODO: remove from queue when dropped/cancelled
-    job_queue: Mutex<VecDeque<(Instant, oneshot::Sender<Permit>)>>,
 }
 
 #[bon]
@@ -76,8 +68,7 @@ where
 
         let num_partitions = weights.len();
 
-        let total_limiter = TotalLimiter::new(limit_algo, max_queue_size);
-        let scheduler = Scheduler::new(total_limiter, weights);
+        let scheduler = Scheduler::new(limit_algo, max_queue_size, weights);
 
         let mut partitions = Vec::with_capacity(num_partitions);
         for i in 0..num_partitions {
@@ -129,22 +120,22 @@ where
     /// partitions of 25%, 25% and 50% of the total limit, respectively.
     ///
     /// `weights` must not be empty.
-    pub(crate) fn new(total_limiter: TotalLimiter<T>, weights: Vec<f64>) -> Arc<Self> {
+    pub(crate) fn new(limit_algo: T, max_queue_size: usize, weights: Vec<f64>) -> Arc<Self> {
         assert!(!weights.is_empty(), "Must provide at least one weight");
 
         let total: f64 = weights.iter().sum();
+        let fractions: Vec<f64> = weights.iter().map(|w| w / total).collect();
 
-        let mut partition_states = Vec::with_capacity(weights.len());
+        let total_limiter =
+            TotalLimiter::new_weighted(limit_algo, max_queue_size, fractions.clone());
 
-        for weight in weights {
-            let fraction = weight / total;
-
-            partition_states.push(PartitionState {
+        let partition_states = fractions
+            .into_iter()
+            .map(|fraction| PartitionState {
                 fraction,
                 in_flight: AtomicCapacityUnit::new(0),
-                job_queue: Mutex::new(VecDeque::default()),
-            });
-        }
+            })
+            .collect();
 
         Arc::new(Scheduler {
             total_limiter,
@@ -178,88 +169,16 @@ where
     }
 
     async fn acquire_timeout(&self, duration: Duration, index: StateIndex) -> Option<Permit> {
-        let partition = self
-            .partition_states
-            .get(index)
-            .expect("partition index should not be out of bounds");
-
-        match timeout(duration, async {
-            // First we try without the lock, then if we don't succeed we lock the queue and try
-            // again. This is OK because there should never be a state where a job is in the
-            // queue whilst there are available permits.
-            let rx = {
-                let mut lock = None;
-                let mut locked_queue = loop {
-                    let total_limit = self.total_limiter.limit();
-
-                    // Cases:
-                    // 1. Partition: available, total: available -> acquire
-                    // 2. Partition: available, total: full -> queue
-                    //    (another partition has borrowed)
-                    // 3. Partition: full, total: spare -> acquire
-                    // 4. Partition: full, total: no spare -> queue
-
-                    // First, check if we might have capacity.
-                    if partition.has_capacity_available(total_limit)
-                        || self.has_spare_capacity(total_limit)
-                    {
-                        // Either this partition has capacity, or there's some spare capacity we can
-                        // borrow.
-
-                        // Let's see if the there's a permit available (this might change by
-                        // time we try to acquire it).
-                        let permit = self.total_limiter.try_acquire();
-
-                        if permit.is_some() {
-                            return permit;
-                        }
-                    }
-
-                    // If not, then we might have to queue this job.
-                    break match lock {
-                        None => {
-                            // Any jobs in this partition will lock the queue before returning their
-                            // permit, so locking the queue here prevents any new permits being added
-                            // underneath us.
-
-                            // We might miss available spare capacity *from other partitions*, but
-                            // that's OK.
-
-                            // So lock the queue and try again.
-                            lock = Some(match partition.job_queue.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            });
-                            continue;
-                        }
-
-                        // We locked the queue and there is still no available capacity
-                        Some(lock) => lock,
-                    };
-                };
-
-                // No available capacity. We'll have to wait.
-
-                let (tx, rx) = oneshot::channel();
-                locked_queue.push_back((Instant::now(), tx));
-                drop(locked_queue);
-
-                rx
-            };
-
-            // Wait for a permit to be recycled.
-            let permit = rx.await;
-
-            permit.ok()
-        })
-        .await
+        match self
+            .total_limiter
+            .acquire_timeout_from_queue(duration, index)
+            .await
         {
-            Ok(Some(permit)) => {
+            Some(permit) => {
                 self.partition_states[index].inc_in_flight();
                 Some(permit)
             }
-            Err(_) => None,
-            Ok(None) => None,
+            None => None,
         }
     }
 
@@ -270,73 +189,6 @@ where
         _index: StateIndex,
     ) -> CapacityUnit {
         self.total_limiter.update_limit(outcome, latency).await
-    }
-
-    /// When a permit becomes available, give it to the next job in the queue with the highest
-    /// priority.
-    ///
-    /// The underlying semaphore is simply a FIFO queue. Instead, what we want is a kind of priority
-    /// queue, where the priority is based on the time a job has been waiting and the weight of the
-    /// partition.
-    fn recycle_permit(self: &Arc<Self>, permit: Permit, index: StateIndex) {
-        self.partition_states[index].dec_in_flight();
-
-        /// Like a normal FIFO queue, items which arrive first have higher priority.
-        ///
-        /// However, this priority is weighted per partition. Partitions with higher weights have
-        /// higher priority.
-        fn priority(weight: f64, time_in_q: Duration) -> f64 {
-            weight * time_in_q.as_secs_f64()
-        }
-
-        let scheduler = Arc::clone(self);
-        tokio::spawn(async move {
-            // Loop to skip over stale entries (receivers dropped due to timeout).
-            //
-            // Each iteration does a full O(p) scan over partitions to find the highest-priority
-            // waiter, then attempts to send. If the receiver was dropped, we retry with the next
-            // highest-priority entry.
-            //
-            // Worst case O(p*j): if every queued entry across all p partitions is stale, we do
-            // one full scan per stale entry j. Proper cancellation on timeout (removing entries
-            // from the queue when the caller drops) would reduce this to O(p).
-            let mut permit = permit;
-            loop {
-                let mut highest_priority = 0.0;
-                let mut locked_queue = None;
-
-                // Iterate through all partitions to find the job with the highest priority.
-                // The item at the front of each queue has the highest priority for that partition.
-                for p in scheduler.partition_states.iter() {
-                    let q = match p.job_queue.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    if let Some((instant, _tx)) = q.front() {
-                        let job_priority = priority(p.fraction, instant.elapsed());
-                        if job_priority > highest_priority {
-                            highest_priority = job_priority;
-                            locked_queue = Some(q);
-                        }
-                    }
-                }
-
-                match locked_queue {
-                    Some(mut queue) => {
-                        let (_, tx) = queue.pop_front().unwrap();
-                        drop(queue);
-                        match tx.send(permit) {
-                            Ok(()) => break,
-                            Err(p) => permit = p, // stale entry: retry with next waiter
-                        }
-                    }
-                    None => {
-                        scheduler.total_limiter.release(permit);
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     /// Total spare capacity which can be used by any partition.
@@ -360,7 +212,8 @@ impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
     }
 
     fn release(&self, permit: Permit) {
-        self.scheduler.recycle_permit(permit, self.state_index);
+        self.scheduler.partition_states[self.state_index].dec_in_flight();
+        self.scheduler.total_limiter.release(permit);
     }
 }
 
@@ -592,9 +445,6 @@ mod tests {
         let t1 = partitions[0].try_acquire().unwrap();
         t1.set_outcome(Outcome::Success).await;
 
-        // The permit recycling is async in a new task
-        tokio::task::yield_now().await;
-
         let t2 = partitions[0].try_acquire().unwrap();
         t2.set_outcome(Outcome::Success).await;
 
@@ -603,58 +453,64 @@ mod tests {
         assert_eq!(samples[1].in_flight, 1, "second sample: should not grow");
     }
 
+    /// A waiter from a higher-weight partition is served before a waiter from a lower-weight
+    /// partition, even if the lower-weight waiter has been waiting longer.
     #[tokio::test(start_paused = true)]
-    async fn stale_queue_entries_are_skipped() {
+    async fn priority_ordering() {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(1);
 
+        // Partition 0: weight 1 (fraction 1/11)
+        // Partition 1: weight 10 (fraction 10/11)
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
-            .weights(vec![1.0])
+            .weights(vec![1.0, 10.0])
             .build();
 
-        // Acquire the only permit.
         let t0 = partitions[0].try_acquire().unwrap();
 
-        // Queue waiter1 with a short timeout. It will expire, leaving a stale tx in the queue.
-        let waiter1 = tokio::spawn({
+        let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Queue a waiter for the low-weight partition 0.
+        let w0 = tokio::spawn({
             let p = Arc::clone(&partitions[0]);
-            async move { p.acquire_timeout(Duration::from_millis(10)).await }
+            let order = Arc::clone(&order);
+            async move {
+                let _t = p.acquire_timeout(Duration::MAX).await.unwrap();
+                order.lock().unwrap().push(0u32);
+                // _t dropped here, waking the next waiter
+            }
         });
+        tokio::task::yield_now().await; // let w0 enter the queue
 
-        // Let waiter1 enter the queue before advancing time.
-        tokio::task::yield_now().await;
+        // Advance time so w0 has been waiting 5ms.
+        tokio::time::advance(Duration::from_millis(5)).await;
 
-        // Advance time slightly so waiter2 records a later queue timestamp (lower priority).
-        tokio::time::advance(Duration::from_millis(1)).await;
-
-        // Queue waiter2 with a long timeout.
-        let waiter2 = tokio::spawn({
-            let p = Arc::clone(&partitions[0]);
-            async move { p.acquire_timeout(Duration::MAX).await.is_some() }
+        // Queue a waiter for the high-weight partition 1.
+        let w1 = tokio::spawn({
+            let p = Arc::clone(&partitions[1]);
+            let order = Arc::clone(&order);
+            async move {
+                let _t = p.acquire_timeout(Duration::MAX).await.unwrap();
+                order.lock().unwrap().push(1u32);
+            }
         });
+        tokio::task::yield_now().await; // let w1 enter the queue
 
-        // Let waiter2 enter the queue.
-        tokio::task::yield_now().await;
+        // Advance time another 5ms. Now:
+        //   w0: weight=1/11, waited=10ms  → priority ≈ 0.00091
+        //   w1: weight=10/11, waited=5ms  → priority ≈ 0.0045  ← wins
+        tokio::time::advance(Duration::from_millis(5)).await;
 
-        // Advance time past waiter1's timeout (10ms), expiring it.
-        tokio::time::advance(Duration::from_millis(20)).await;
-
-        // Await waiter1 to confirm it timed out (and its rx is now dropped).
-        let result1 = waiter1.await.unwrap();
-        assert!(result1.is_none(), "waiter1 should have timed out");
-
-        // Release the permit.
+        // Release the permit. The semaphore serves the highest-priority waiter.
         drop(t0);
 
-        // Let recycle_permit's spawn run.
-        tokio::task::yield_now().await;
+        // w1 should be served first; after it drops its token w0 gets served.
+        w1.await.unwrap();
+        w0.await.unwrap();
 
-        // waiter2 should receive the permit despite the stale entry.
-        let got_permit = waiter2.await.unwrap();
-        assert!(got_permit, "waiter2 should receive the permit");
+        assert_eq!(*order.lock().unwrap(), vec![1, 0]);
     }
 
     // TODO: test fairness
-    // TODO: test prioritisation
 }

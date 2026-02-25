@@ -38,8 +38,29 @@ where
             limit_algo,
             semaphore: Arc::new(
                 Semaphore::builder()
-                    .max_permits(initial_permits)
+                    .initial_permits(initial_permits)
                     .max_queue_size(max_queue_size)
+                    .build(),
+            ),
+            limit: AtomicCapacityUnit::new(initial_permits),
+            in_flight: AtomicCapacityUnit::new(0),
+
+            #[cfg(test)]
+            notifier: None,
+        }
+    }
+
+    pub(crate) fn new_weighted(limit_algo: T, max_queue_size: usize, weights: Vec<f64>) -> Self {
+        let initial_permits = limit_algo.limit();
+        assert!(initial_permits >= 1);
+
+        TotalLimiter {
+            limit_algo,
+            semaphore: Arc::new(
+                Semaphore::builder()
+                    .initial_permits(initial_permits)
+                    .max_queue_size(max_queue_size)
+                    .weights(weights)
                     .build(),
             ),
             limit: AtomicCapacityUnit::new(initial_permits),
@@ -101,7 +122,18 @@ where
     }
 
     pub(crate) async fn acquire_timeout(&self, duration: Duration) -> Option<Permit> {
-        match Arc::clone(&self.semaphore).acquire_timeout(duration).await {
+        self.acquire_timeout_from_queue(duration, 0).await
+    }
+
+    pub(crate) async fn acquire_timeout_from_queue(
+        &self,
+        duration: Duration,
+        queue_idx: usize,
+    ) -> Option<Permit> {
+        match Arc::clone(&self.semaphore)
+            .acquire_timeout(duration, queue_idx)
+            .await
+        {
             Ok(permit) => {
                 self.inc_in_flight();
                 Some(permit)

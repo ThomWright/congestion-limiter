@@ -2,6 +2,8 @@
 
 Dynamic concurrency limits for controlling backpressure, inspired by TCP congestion control.
 
+**Note:** This library is a PoC, and not production-ready.
+
 [![Crates.io][crates-badge]][crates-url]
 [![MIT licensed][mit-badge]][mit-url]
 [![Docs][docs-badge]][docs-url]
