@@ -2,6 +2,8 @@
 
 Dynamic concurrency limits for controlling backpressure, inspired by TCP congestion control.
 
+It's like a nightclub bouncer: it only lets so many people in at once. Or a better analogy might be a bouncer at a [supermarket](doc-supermarket).
+
 **Note:** This library is a PoC, and not production-ready.
 
 [![Crates.io][crates-badge]][crates-url]
