@@ -260,14 +260,134 @@ module multi_pool {
     // Actions
     // -----------------------------------------------------------------------
 
-    action stutter = all {
-        pools' = pools,
-        permits' = permits,
+    /// Acquire a permit from the caller's own pool.
+    ///
+    /// Guard: pool has available > 0
+    action acquire_own(pool_idx: int): bool = all {
+        pools.get(pool_idx).available > 0,
+        pools' = pools.set(pool_idx, { ...pools.get(pool_idx),
+            available: pools.get(pool_idx).available - 1,
+        }),
+        permits' = permits.union(Set({
+            id: next_id, home_pool: pool_idx, user_pool: pool_idx,
+        })),
+        next_id' = next_id + 1,
         total_limit' = total_limit,
-        next_id' = next_id,
     }
 
-    action step = stutter
+    /// Borrow a permit from a donor pool that has spare capacity above
+    /// its buffer threshold. The permit records the donor as home_pool
+    /// so it returns there later.
+    ///
+    /// Guard: own pool empty, donor has available > buffer(donor.limit)
+    action acquire_borrow(pool_idx: int, donor_idx: int): bool = all {
+        pool_idx != donor_idx,
+        pools.get(pool_idx).available == 0,
+        pools.get(donor_idx).available > buffer(pools.get(donor_idx).limit),
+        pools' = pools.set(donor_idx, { ...pools.get(donor_idx),
+            available: pools.get(donor_idx).available - 1,
+        }),
+        permits' = permits.union(Set({
+            id: next_id, home_pool: donor_idx, user_pool: pool_idx,
+        })),
+        next_id' = next_id + 1,
+        total_limit' = total_limit,
+    }
+
+    /// Try to acquire a permit: own pool first, then borrow from any
+    /// donor with spare capacity.
+    action try_acquire = {
+        nondet pool_idx = oneOf(POOL_INDICES)
+        any {
+            acquire_own(pool_idx),
+            nondet donor_idx = oneOf(POOL_INDICES)
+            acquire_borrow(pool_idx, donor_idx),
+        }
+    }
+
+    /// Return a permit. The permit goes back to its home pool. Four
+    /// outcomes, checked in order:
+    ///
+    /// 1. home pool has priority_reduction > 0 → consume (permit destroyed)
+    /// 2. home pool's queue has a waiter → wake it (permit stays in-flight)
+    /// 3. home pool has spare and another pool has a queued waiter →
+    ///    lend to that waiter (permit stays in-flight, re-homed)
+    /// 4. otherwise → return to home pool's available
+    action return_permit = {
+        nondet permit = oneOf(permits)
+        val home = permit.home_pool
+        val hp = pools.get(home)
+        if (hp.priority_reduction > 0) {
+            // Case 1: consume the permit to satisfy a pending reduction.
+            all {
+                pools' = pools.set(home, { ...hp,
+                    priority_reduction: hp.priority_reduction - 1,
+                }),
+                permits' = permits.exclude(Set(permit)),
+                total_limit' = total_limit,
+                next_id' = next_id,
+            }
+        } else if (length(hp.queue) > 0) {
+            // Case 2: wake the home pool's front waiter. The permit
+            // transfers directly — one holder out, one holder in.
+            all {
+                pools' = pools.set(home, { ...hp,
+                    queue: tail(hp.queue),
+                }),
+                // Remove the old permit, add a new one for the woken waiter.
+                permits' = permits.exclude(Set(permit)).union(Set({
+                    id: next_id, home_pool: home, user_pool: home,
+                })),
+                next_id' = next_id + 1,
+                total_limit' = total_limit,
+            }
+        } else if (hp.available >= buffer(hp.limit)) {
+            // Case 3: home pool would have spare after return. Instead of
+            // adding to available, lend to another pool's queued waiter.
+            // Non-deterministically pick which other pool to serve.
+            val other_pools_with_waiters = POOL_INDICES.filter(i =>
+                i != home and length(pools.get(i).queue) > 0
+            )
+            if (other_pools_with_waiters.size() > 0) {
+                nondet other = oneOf(other_pools_with_waiters)
+                val op = pools.get(other)
+                all {
+                    pools' = pools
+                        .set(other, { ...op, queue: tail(op.queue) }),
+                    permits' = permits.exclude(Set(permit)).union(Set({
+                        id: next_id, home_pool: home, user_pool: other,
+                    })),
+                    next_id' = next_id + 1,
+                    total_limit' = total_limit,
+                }
+            } else {
+                // No other pool has waiters — fall through to case 4.
+                all {
+                    pools' = pools.set(home, { ...hp,
+                        available: hp.available + 1,
+                    }),
+                    permits' = permits.exclude(Set(permit)),
+                    total_limit' = total_limit,
+                    next_id' = next_id,
+                }
+            }
+        } else {
+            // Case 4: return to home pool's available.
+            all {
+                pools' = pools.set(home, { ...hp,
+                    available: hp.available + 1,
+                }),
+                permits' = permits.exclude(Set(permit)),
+                total_limit' = total_limit,
+                next_id' = next_id,
+            }
+        }
+    }
+
+    action step = any {
+        try_acquire,
+        return_permit,
+    }
 }
 
 // ---------------------------------------------------------------------------
