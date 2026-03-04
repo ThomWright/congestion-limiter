@@ -30,8 +30,15 @@ module multi_pool {
     // Types
     // -----------------------------------------------------------------------
 
+    type Pool = {
+        available: int,
+        limit: int,
+        priority_reduction: int,
+        queue: List[int],
+    }
+
     /// A permit in flight, tracking where it came from and who's using it.
-    type PermitId = {
+    type Permit = {
         id: int,
         home_pool: int,
         user_pool: int,
@@ -41,20 +48,11 @@ module multi_pool {
     // State variables
     // -----------------------------------------------------------------------
 
-    /// Per-pool available permits.
-    var pool_available: int -> int
-
-    /// Per-pool target limit (sum == total_limit).
-    var pool_limit: int -> int
-
-    /// Per-pool priority reduction counter.
-    var pool_priority_reduction: int -> int
-
-    /// Per-pool queue of waiter IDs.
-    var pool_queue: int -> List[int]
+    /// Per-pool state, keyed by pool index.
+    var pools: int -> Pool
 
     /// Set of permits currently in flight.
-    var permits: Set[PermitId]
+    var permits: Set[Permit]
 
     /// The current total limit across all pools.
     var total_limit: int
@@ -63,17 +61,18 @@ module multi_pool {
     var next_id: int
 
     // -----------------------------------------------------------------------
-    // Helpers
+    // Utility functions
     // -----------------------------------------------------------------------
 
     pure def min(a: int, b: int): int = if (a < b) a else b
+    pure def max(a: int, b: int): int = if (a > b) a else b
 
     /// The set of valid pool indices.
     val POOL_INDICES = 0.to(NUM_POOLS - 1)
 
     /// Sum a function over all pools.
-    pure def sum_over(pools: Set[int], f: int => int): int =
-        pools.fold(0, (acc, i) => acc + f(i))
+    pure def sum_over(idxs: Set[int], f: int => int): int =
+        idxs.fold(0, (acc, i) => acc + f(i))
 
     /// Number of in-flight permits for a given pool (as user).
     val pool_in_flight = POOL_INDICES.mapBy(
@@ -89,8 +88,6 @@ module multi_pool {
             if (tenth * 10 < limit) tenth + 1 else max(tenth, 1)
         }
 
-    pure def max(a: int, b: int): int = if (a > b) a else b
-
     /// Distribute `total` across pools proportional to WEIGHTS using the
     /// largest remainder method.
     ///
@@ -98,28 +95,21 @@ module multi_pool {
     /// Guarantees: sum of allocations == total.
     pure def distribute(total: int, weights: List[int]): int -> int = {
         val weight_sum = weights.indices().fold(0, (acc, i) => acc + weights[i])
-        // Integer part: floor(total * weight[i] / weight_sum)
         val floors = weights.indices().mapBy(
             i => (total * weights[i]) / weight_sum
         )
         val floor_sum = weights.indices().fold(0, (acc, i) => acc + floors.get(i))
         val remainder = total - floor_sum
-        // Remainders: fractional parts, sorted descending to assign +1 to top `remainder` pools.
-        // For simplicity with integer arithmetic: remainder_i = (total * weight[i]) % weight_sum
         val remainders = weights.indices().mapBy(
             i => (total * weights[i]) % weight_sum
         )
-        // Find the `remainder`-th largest remainder value as cutoff.
-        // Pools with remainder above cutoff get +1.
-        // This is a simplified version — ties are broken by lowest index.
         if (remainder == 0) floors
         else {
-            // Greedily assign: sort indices by remainder descending, take first `remainder`.
-            // Since Quint sets are unordered, we iterate and count.
-            val sorted_remainders = POOL_INDICES.fold(Set(), (selected, _) => {
+            // Greedily assign +1 to the pools with the largest remainders.
+            // Ties broken by lowest index.
+            val winners = POOL_INDICES.fold(Set(), (selected, _) => {
                 if (selected.size() >= remainder) selected
                 else {
-                    // Pick the unselected pool with the largest remainder (lowest index tiebreak)
                     val candidates = POOL_INDICES.exclude(selected)
                     val best = candidates.fold(-1, (best_so_far, i) =>
                         if (best_so_far == -1) i
@@ -131,23 +121,29 @@ module multi_pool {
                 }
             })
             POOL_INDICES.mapBy(i =>
-                if (sorted_remainders.contains(i)) floors.get(i) + 1
+                if (winners.contains(i)) floors.get(i) + 1
                 else floors.get(i)
             )
         }
     }
+
+    /// Build initial pool state from a distribution map.
+    pure def init_pools(dist: int -> int): int -> Pool =
+        dist.keys().mapBy(i => {
+            available: dist.get(i),
+            limit: dist.get(i),
+            priority_reduction: 0,
+            queue: [],
+        })
 
     // -----------------------------------------------------------------------
     // Initialisation
     // -----------------------------------------------------------------------
 
     action init = {
-        val initial_distribution = distribute(INITIAL_PERMITS, WEIGHTS)
+        val dist = distribute(INITIAL_PERMITS, WEIGHTS)
         all {
-            pool_available' = initial_distribution,
-            pool_limit' = initial_distribution,
-            pool_priority_reduction' = POOL_INDICES.mapBy(i => 0),
-            pool_queue' = POOL_INDICES.mapBy(i => []),
+            pools' = init_pools(dist),
             permits' = Set(),
             total_limit' = INITIAL_PERMITS,
             next_id' = 0,
@@ -163,33 +159,33 @@ module multi_pool {
     /// permit counts against the user pool's in_flight but the donor pool's
     /// available. Defined here for reference but excluded from `inv`.
     val per_pool_conservation = POOL_INDICES.forall(i =>
-        pool_available.get(i) + pool_in_flight.get(i)
-            == pool_limit.get(i) + pool_priority_reduction.get(i)
+        pools.get(i).available + pool_in_flight.get(i)
+            == pools.get(i).limit + pools.get(i).priority_reduction
     )
 
     /// Global conservation: sum(available) + sum(in_flight) == total_limit + sum(priority_reduction)
     val global_conservation = {
-        val sum_available = sum_over(POOL_INDICES, i => pool_available.get(i))
+        val sum_available = sum_over(POOL_INDICES, i => pools.get(i).available)
         val sum_in_flight = permits.size()
-        val sum_reduction = sum_over(POOL_INDICES, i => pool_priority_reduction.get(i))
+        val sum_reduction = sum_over(POOL_INDICES, i => pools.get(i).priority_reduction)
         sum_available + sum_in_flight == total_limit + sum_reduction
     }
 
     /// Nothing goes negative.
     val non_negative = POOL_INDICES.forall(i => and {
-        pool_available.get(i) >= 0,
-        pool_priority_reduction.get(i) >= 0,
-        pool_limit.get(i) >= 0,
+        pools.get(i).available >= 0,
+        pools.get(i).priority_reduction >= 0,
+        pools.get(i).limit >= 0,
     })
 
     /// Each pool's queue respects its bound.
     val queues_bounded = POOL_INDICES.forall(i =>
-        length(pool_queue.get(i)) <= MAX_QUEUE_SIZE
+        length(pools.get(i).queue) <= MAX_QUEUE_SIZE
     )
 
     /// Pool limits sum to total_limit.
     val limits_sum_correct =
-        sum_over(POOL_INDICES, i => pool_limit.get(i)) == total_limit
+        sum_over(POOL_INDICES, i => pools.get(i).limit) == total_limit
 
     // -----------------------------------------------------------------------
     // Refinement: single-pool projection
@@ -197,15 +193,15 @@ module multi_pool {
 
     // Project multi-pool state down to aggregate single-pool values.
     val projected_available =
-        sum_over(POOL_INDICES, i => pool_available.get(i))
+        sum_over(POOL_INDICES, i => pools.get(i).available)
 
     val projected_in_flight = permits.size()
 
     val projected_priority_reduction =
-        sum_over(POOL_INDICES, i => pool_priority_reduction.get(i))
+        sum_over(POOL_INDICES, i => pools.get(i).priority_reduction)
 
     val projected_queue_length =
-        sum_over(POOL_INDICES, i => length(pool_queue.get(i)))
+        sum_over(POOL_INDICES, i => length(pools.get(i).queue))
 
     /// The single-pool conservation law holds on the projected state.
     val refines_single_pool_conservation =
@@ -265,10 +261,7 @@ module multi_pool {
     // -----------------------------------------------------------------------
 
     action stutter = all {
-        pool_available' = pool_available,
-        pool_limit' = pool_limit,
-        pool_priority_reduction' = pool_priority_reduction,
-        pool_queue' = pool_queue,
+        pools' = pools,
         permits' = permits,
         total_limit' = total_limit,
         next_id' = next_id,
