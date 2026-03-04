@@ -426,11 +426,87 @@ module multi_pool {
         }
     }
 
+    /// Change the total permit limit. Redistributes across pools
+    /// proportionally using the largest remainder method.
+    ///
+    /// For each pool, given its new target limit:
+    ///   If increasing: cancel priority reductions, wake waiters, add to available
+    ///   If decreasing: consume available, remainder becomes priority_reduction
+    action set_limit = {
+        nondet new_total = oneOf(0.to(2 * INITIAL_PERMITS))
+        val new_dist = distribute(new_total, WEIGHTS)
+        // Fold over each pool, accumulating the updated pools map, new
+        // permits (from woken waiters), and the next_id counter.
+        val result = POOL_INDICES.fold(
+            { new_pools: pools, new_permits: permits, nid: next_id },
+            (acc, i) => {
+                val p = pools.get(i)
+                val new_limit = new_dist.get(i)
+                val delta = new_limit - p.limit
+                if (delta > 0) {
+                    // Increasing: cancel reductions, wake waiters, add to available
+                    val cancel_reductions = min(delta, p.priority_reduction)
+                    val after_cancel = delta - cancel_reductions
+                    val wake = min(after_cancel, length(p.queue))
+                    val add_available = after_cancel - wake
+                    // Create permits for woken waiters
+                    val woken_permits = 0.to(wake - 1).fold(
+                        { ps: acc.new_permits, id: acc.nid },
+                        (pacc, _) => {
+                            ps: pacc.ps.union(Set({
+                                id: pacc.id, home_pool: i, user_pool: i,
+                            })),
+                            id: pacc.id + 1,
+                        }
+                    )
+                    {
+                        new_pools: acc.new_pools.set(i, { ...p,
+                            limit: new_limit,
+                            priority_reduction: p.priority_reduction - cancel_reductions,
+                            queue: slice(p.queue, wake, length(p.queue)),
+                            available: p.available + add_available,
+                        }),
+                        new_permits: woken_permits.ps,
+                        nid: woken_permits.id,
+                    }
+                } else if (delta < 0) {
+                    // Decreasing: consume available, remainder → priority_reduction
+                    val abs_delta = -delta
+                    val consume = min(abs_delta, p.available)
+                    val new_reductions = abs_delta - consume
+                    {
+                        new_pools: acc.new_pools.set(i, { ...p,
+                            limit: new_limit,
+                            available: p.available - consume,
+                            priority_reduction: p.priority_reduction + new_reductions,
+                        }),
+                        new_permits: acc.new_permits,
+                        nid: acc.nid,
+                    }
+                } else {
+                    // delta == 0: just update limit (may differ due to rounding)
+                    {
+                        new_pools: acc.new_pools.set(i, { ...p, limit: new_limit }),
+                        new_permits: acc.new_permits,
+                        nid: acc.nid,
+                    }
+                }
+            }
+        )
+        all {
+            pools' = result.new_pools,
+            permits' = result.new_permits,
+            next_id' = result.nid,
+            total_limit' = new_total,
+        }
+    }
+
     action step = any {
         acquire_success,
         acquire_queued,
         return_permit,
         cancel,
+        set_limit,
     }
 }
 
@@ -452,7 +528,7 @@ module multi_pool_verify {
 module multi_pool_test {
     import multi_pool(
         NUM_POOLS = 3,
-        INITIAL_PERMITS = 6,
+        INITIAL_PERMITS = 3,
         MAX_QUEUE_SIZE = 2,
         WEIGHTS = [1, 2, 3]
     ).*
