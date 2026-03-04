@@ -95,11 +95,12 @@ module single_pool {
     // Actions
     // -----------------------------------------------------------------------
 
-    /// Acquire a permit immediately, if one is available. No queueing.
+    /// Acquire a permit successfully. A permit is available and the
+    /// caller gets it immediately.
     ///
     /// Guard: available > 0
     /// Effect: move one permit from available → in_flight
-    action try_acquire = all {
+    action acquire_success = all {
         s.available > 0,
         s' = { ...s, available: s.available - 1, in_flight: s.in_flight + 1 },
     }
@@ -133,12 +134,12 @@ module single_pool {
         },
     }
 
-    /// A caller tries to acquire but no permit is available, so they join
+    /// Acquire attempt where no permit is available. The caller joins
     /// the queue to wait.
     ///
     /// Guard: available == 0 AND queue not full
     /// Effect: add a new waiter ID to the back of the queue
-    action enqueue = all {
+    action acquire_queued = all {
         s.available == 0,
         length(s.queue) < MAX_QUEUE_SIZE,
         s' = { ...s,
@@ -208,9 +209,9 @@ module single_pool {
 
     /// The next-state relation: non-deterministically pick one enabled action.
     action step = any {
-        try_acquire,
+        acquire_success,
+        acquire_queued,
         return_permit,
-        enqueue,
         cancel,
         set_limit,
     }

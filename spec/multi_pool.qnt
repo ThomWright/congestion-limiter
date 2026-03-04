@@ -294,9 +294,9 @@ module multi_pool {
         total_limit' = total_limit,
     }
 
-    /// Try to acquire a permit: own pool first, then borrow from any
-    /// donor with spare capacity.
-    action try_acquire = {
+    /// Acquire a permit successfully: own pool first, then borrow from
+    /// any donor with spare capacity.
+    action acquire_success = {
         nondet pool_idx = oneOf(POOL_INDICES)
         any {
             acquire_own(pool_idx),
@@ -384,9 +384,53 @@ module multi_pool {
         }
     }
 
+    /// Acquire attempt where no permit is available (own pool empty, no
+    /// donor with spare). The caller joins their pool's queue to wait.
+    ///
+    /// Guard: own pool empty, no donor has spare, queue not full
+    action acquire_queued = {
+        nondet pool_idx = oneOf(POOL_INDICES)
+        val p = pools.get(pool_idx)
+        val no_donor = POOL_INDICES.forall(d =>
+            d == pool_idx or pools.get(d).available <= buffer(pools.get(d).limit)
+        )
+        all {
+            p.available == 0,
+            no_donor,
+            length(p.queue) < MAX_QUEUE_SIZE,
+            pools' = pools.set(pool_idx, { ...p,
+                queue: p.queue.append(next_id),
+            }),
+            permits' = permits,
+            next_id' = next_id + 1,
+            total_limit' = total_limit,
+        }
+    }
+
+    /// A queued waiter times out or is cancelled. They leave the queue
+    /// without acquiring a permit.
+    action cancel = {
+        nondet pool_idx = oneOf(POOL_INDICES)
+        val p = pools.get(pool_idx)
+        all {
+            length(p.queue) > 0,
+            nondet idx = oneOf(indices(p.queue))
+            pools' = pools.set(pool_idx, { ...p,
+                queue: slice(p.queue, 0, idx).concat(
+                    slice(p.queue, idx + 1, length(p.queue))
+                ),
+            }),
+            permits' = permits,
+            next_id' = next_id,
+            total_limit' = total_limit,
+        }
+    }
+
     action step = any {
-        try_acquire,
+        acquire_success,
+        acquire_queued,
         return_permit,
+        cancel,
     }
 }
 
@@ -398,7 +442,7 @@ module multi_pool {
 module multi_pool_verify {
     import multi_pool(
         NUM_POOLS = 2,
-        INITIAL_PERMITS = 4,
+        INITIAL_PERMITS = 2,
         MAX_QUEUE_SIZE = 1,
         WEIGHTS = [1, 3]
     ).*
