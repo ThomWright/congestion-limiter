@@ -2,3 +2,12 @@
 /Cargo.lock
 /_apalache-out
 tmp
+
+# Generated TLA+ and TLC output
+spec/*.tla
+spec/states/
+
+# Hand-written TLA+ stubs and TLC wrappers
+!spec/Apalache.tla
+!spec/Variants.tla
+!spec/multi_pool_tlc.tla
