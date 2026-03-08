@@ -26,8 +26,7 @@ module single_pool {
         in_flight: int,
         priority_reduction: int,
         total_limit: int,
-        queue: List[int],
-        next_waiter_id: int,
+        queue_len: int,
     }
 
     // -----------------------------------------------------------------------
@@ -52,8 +51,7 @@ module single_pool {
             in_flight: 0,
             priority_reduction: 0,
             total_limit: INITIAL_PERMITS,
-            queue: [],
-            next_waiter_id: 0,
+            queue_len: 0,
         },
     }
 
@@ -77,12 +75,13 @@ module single_pool {
         s.available >= 0,
         s.in_flight >= 0,
         s.priority_reduction >= 0,
-        s.total_limit >= 0,
+        s.total_limit >= 1,
+        s.queue_len >= 0,
     }
 
     /// Queue respects its bound.
     val queue_bounded =
-        length(s.queue) <= MAX_QUEUE_SIZE
+        s.queue_len <= MAX_QUEUE_SIZE
 
     /// All invariants combined.
     val inv = and {
@@ -120,11 +119,11 @@ module single_pool {
                 in_flight: s.in_flight - 1,
                 priority_reduction: s.priority_reduction - 1,
             }
-        } else if (length(s.queue) > 0) {
+        } else if (s.queue_len > 0) {
             // Case 2: wake the front waiter. The permit transfers directly
             // from the returner to the waiter — in_flight stays the same
             // (one holder out, one holder in).
-            s' = { ...s, queue: tail(s.queue) }
+            s' = { ...s, queue_len: s.queue_len - 1 }
         } else {
             // Case 3: no reduction pending, no waiters — return to pool.
             s' = { ...s,
@@ -138,31 +137,19 @@ module single_pool {
     /// the queue to wait.
     ///
     /// Guard: available == 0 AND queue not full
-    /// Effect: add a new waiter ID to the back of the queue
     action acquire_queued = all {
         s.available == 0,
-        length(s.queue) < MAX_QUEUE_SIZE,
-        s' = { ...s,
-            queue: s.queue.append(s.next_waiter_id),
-            next_waiter_id: s.next_waiter_id + 1,
-        },
+        s.queue_len < MAX_QUEUE_SIZE,
+        s' = { ...s, queue_len: s.queue_len + 1 },
     }
 
     /// A queued waiter times out or is cancelled. They leave the queue
     /// without acquiring a permit.
     ///
-    /// Any waiter in the queue can be cancelled (not just the front),
-    /// since timeouts can expire in any order.
-    ///
     /// Guard: queue is non-empty
     action cancel = all {
-        length(s.queue) > 0,
-        nondet idx = oneOf(indices(s.queue))
-        s' = { ...s,
-            queue: slice(s.queue, 0, idx).concat(
-                slice(s.queue, idx + 1, length(s.queue))
-            ),
-        },
+        s.queue_len > 0,
+        s' = { ...s, queue_len: s.queue_len - 1 },
     }
 
     /// Change the total permit limit. Unifies increasing and decreasing
@@ -179,18 +166,18 @@ module single_pool {
     action set_limit = {
         // Non-deterministically pick a new limit. Bounded to keep
         // the state space finite for model checking.
-        nondet new_total = oneOf(0.to(2 * INITIAL_PERMITS))
+        nondet new_total = oneOf(1.to(2 * INITIAL_PERMITS))
         val delta = new_total - s.total_limit
         if (delta > 0) {
             val cancel_reductions = min(delta, s.priority_reduction)
             val after_cancel = delta - cancel_reductions
-            val wake_waiters = min(after_cancel, length(s.queue))
+            val wake_waiters = min(after_cancel, s.queue_len)
             val add_to_available = after_cancel - wake_waiters
             s' = { ...s,
                 total_limit: new_total,
                 priority_reduction: s.priority_reduction - cancel_reductions,
                 in_flight: s.in_flight + wake_waiters,
-                queue: slice(s.queue, wake_waiters, length(s.queue)),
+                queue_len: s.queue_len - wake_waiters,
                 available: s.available + add_to_available,
             }
         } else if (delta < 0) {

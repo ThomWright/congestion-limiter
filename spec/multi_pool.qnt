@@ -34,14 +34,7 @@ module multi_pool {
         available: int,
         limit: int,
         priority_reduction: int,
-        queue: List[int],
-    }
-
-    /// A permit in flight, tracking where it came from and who's using it.
-    type Permit = {
-        id: int,
-        home_pool: int,
-        user_pool: int,
+        queue_len: int,
     }
 
     // -----------------------------------------------------------------------
@@ -51,14 +44,11 @@ module multi_pool {
     /// Per-pool state, keyed by pool index.
     var pools: int -> Pool
 
-    /// Set of permits currently in flight.
-    var permits: Set[Permit]
+    /// In-flight permit counts by (home_pool, user_pool) pair.
+    var in_flight: (int, int) -> int
 
     /// The current total limit across all pools.
     var total_limit: int
-
-    /// Counter for generating unique IDs (waiters and permits).
-    var next_id: int
 
     // -----------------------------------------------------------------------
     // Utility functions
@@ -70,14 +60,25 @@ module multi_pool {
     /// The set of valid pool indices.
     val POOL_INDICES = 0.to(NUM_POOLS - 1)
 
+    /// All valid (home, user) pairs.
+    val ALL_PAIRS = POOL_INDICES.fold(Set(), (acc, h) =>
+        POOL_INDICES.fold(acc, (acc2, u) => acc2.union(Set((h, u))))
+    )
+
+    /// Pairs with at least one in-flight permit.
+    val active_pairs = ALL_PAIRS.filter(k => in_flight.get(k) > 0)
+
     /// Sum a function over all pools.
     pure def sum_over(idxs: Set[int], f: int => int): int =
         idxs.fold(0, (acc, i) => acc + f(i))
 
     /// Number of in-flight permits for a given pool (as user).
-    val pool_in_flight = POOL_INDICES.mapBy(
-        i => permits.filter(p => p.user_pool == i).size()
-    )
+    def user_in_flight(user: int): int =
+        POOL_INDICES.fold(0, (acc, h) => acc + in_flight.get((h, user)))
+
+    /// Total number of in-flight permits across all pools.
+    val total_in_flight =
+        ALL_PAIRS.fold(0, (acc, k) => acc + in_flight.get(k))
 
     /// Buffer threshold for a pool: 10% of its limit, rounded up, minimum 1
     /// (unless limit is 0).
@@ -107,10 +108,12 @@ module multi_pool {
         else {
             // Greedily assign +1 to the pools with the largest remainders.
             // Ties broken by lowest index.
-            val winners = POOL_INDICES.fold(Set(), (selected, _) => {
+            val num_pools = length(weights)
+            val pool_idxs = 0.to(num_pools - 1)
+            val winners = pool_idxs.fold(Set(), (selected, _) => {
                 if (selected.size() >= remainder) selected
                 else {
-                    val candidates = POOL_INDICES.exclude(selected)
+                    val candidates = pool_idxs.exclude(selected)
                     val best = candidates.fold(-1, (best_so_far, i) =>
                         if (best_so_far == -1) i
                         else if (remainders.get(i) > remainders.get(best_so_far)) i
@@ -120,7 +123,7 @@ module multi_pool {
                     selected.union(Set(best))
                 }
             })
-            POOL_INDICES.mapBy(i =>
+            pool_idxs.mapBy(i =>
                 if (winners.contains(i)) floors.get(i) + 1
                 else floors.get(i)
             )
@@ -133,7 +136,7 @@ module multi_pool {
             available: dist.get(i),
             limit: dist.get(i),
             priority_reduction: 0,
-            queue: [],
+            queue_len: 0,
         })
 
     // -----------------------------------------------------------------------
@@ -144,9 +147,8 @@ module multi_pool {
         val dist = distribute(INITIAL_PERMITS, WEIGHTS)
         all {
             pools' = init_pools(dist),
-            permits' = Set(),
+            in_flight' = ALL_PAIRS.mapBy(_ => 0),
             total_limit' = INITIAL_PERMITS,
-            next_id' = 0,
         }
     }
 
@@ -159,28 +161,31 @@ module multi_pool {
     /// permit counts against the user pool's in_flight but the donor pool's
     /// available. Defined here for reference but excluded from `inv`.
     val per_pool_conservation = POOL_INDICES.forall(i =>
-        pools.get(i).available + pool_in_flight.get(i)
+        pools.get(i).available + user_in_flight(i)
             == pools.get(i).limit + pools.get(i).priority_reduction
     )
 
     /// Global conservation: sum(available) + sum(in_flight) == total_limit + sum(priority_reduction)
     val global_conservation = {
         val sum_available = sum_over(POOL_INDICES, i => pools.get(i).available)
-        val sum_in_flight = permits.size()
         val sum_reduction = sum_over(POOL_INDICES, i => pools.get(i).priority_reduction)
-        sum_available + sum_in_flight == total_limit + sum_reduction
+        sum_available + total_in_flight == total_limit + sum_reduction
     }
 
     /// Nothing goes negative.
-    val non_negative = POOL_INDICES.forall(i => and {
-        pools.get(i).available >= 0,
-        pools.get(i).priority_reduction >= 0,
-        pools.get(i).limit >= 0,
-    })
+    val non_negative = and {
+        POOL_INDICES.forall(i => and {
+            pools.get(i).available >= 0,
+            pools.get(i).priority_reduction >= 0,
+            pools.get(i).limit >= 0,
+            pools.get(i).queue_len >= 0,
+        }),
+        ALL_PAIRS.forall(k => in_flight.get(k) >= 0),
+    }
 
     /// Each pool's queue respects its bound.
     val queues_bounded = POOL_INDICES.forall(i =>
-        length(pools.get(i).queue) <= MAX_QUEUE_SIZE
+        pools.get(i).queue_len <= MAX_QUEUE_SIZE
     )
 
     /// Pool limits sum to total_limit.
@@ -195,13 +200,13 @@ module multi_pool {
     val projected_available =
         sum_over(POOL_INDICES, i => pools.get(i).available)
 
-    val projected_in_flight = permits.size()
+    val projected_in_flight = total_in_flight
 
     val projected_priority_reduction =
         sum_over(POOL_INDICES, i => pools.get(i).priority_reduction)
 
     val projected_queue_length =
-        sum_over(POOL_INDICES, i => length(pools.get(i).queue))
+        sum_over(POOL_INDICES, i => pools.get(i).queue_len)
 
     /// The single-pool conservation law holds on the projected state.
     val refines_single_pool_conservation =
@@ -213,7 +218,7 @@ module multi_pool {
         projected_available >= 0,
         projected_in_flight >= 0,
         projected_priority_reduction >= 0,
-        total_limit >= 0,
+        total_limit >= 1,
     }
 
     /// The projected queue respects the aggregate bound.
@@ -257,22 +262,35 @@ module multi_pool {
     }
 
     // -----------------------------------------------------------------------
+    // Helpers for updating in_flight counts
+    // -----------------------------------------------------------------------
+
+    /// Transfer a permit: decrement old pair, increment new pair.
+    /// Handles the case where old == new (net zero change).
+    def transfer_permit(old_pair: (int, int), new_pair: (int, int)): ((int, int) -> int) =
+        if (old_pair == new_pair) in_flight
+        else {
+            val after = in_flight.set(old_pair, in_flight.get(old_pair) - 1)
+            after.set(new_pair, after.get(new_pair) + 1)
+        }
+
+    // -----------------------------------------------------------------------
     // Actions
     // -----------------------------------------------------------------------
 
     /// Acquire a permit from the caller's own pool.
     ///
     /// Guard: pool has available > 0
-    action acquire_own(pool_idx: int): bool = all {
-        pools.get(pool_idx).available > 0,
-        pools' = pools.set(pool_idx, { ...pools.get(pool_idx),
-            available: pools.get(pool_idx).available - 1,
-        }),
-        permits' = permits.union(Set({
-            id: next_id, home_pool: pool_idx, user_pool: pool_idx,
-        })),
-        next_id' = next_id + 1,
-        total_limit' = total_limit,
+    action acquire_own(pool_idx: int): bool = {
+        val pair = (pool_idx, pool_idx)
+        all {
+            pools.get(pool_idx).available > 0,
+            pools' = pools.set(pool_idx, { ...pools.get(pool_idx),
+                available: pools.get(pool_idx).available - 1,
+            }),
+            in_flight' = in_flight.set(pair, in_flight.get(pair) + 1),
+            total_limit' = total_limit,
+        }
     }
 
     /// Borrow a permit from a donor pool that has spare capacity above
@@ -280,18 +298,18 @@ module multi_pool {
     /// so it returns there later.
     ///
     /// Guard: own pool empty, donor has available > buffer(donor.limit)
-    action acquire_borrow(pool_idx: int, donor_idx: int): bool = all {
-        pool_idx != donor_idx,
-        pools.get(pool_idx).available == 0,
-        pools.get(donor_idx).available > buffer(pools.get(donor_idx).limit),
-        pools' = pools.set(donor_idx, { ...pools.get(donor_idx),
-            available: pools.get(donor_idx).available - 1,
-        }),
-        permits' = permits.union(Set({
-            id: next_id, home_pool: donor_idx, user_pool: pool_idx,
-        })),
-        next_id' = next_id + 1,
-        total_limit' = total_limit,
+    action acquire_borrow(pool_idx: int, donor_idx: int): bool = {
+        val pair = (donor_idx, pool_idx)
+        all {
+            pool_idx != donor_idx,
+            pools.get(pool_idx).available == 0,
+            pools.get(donor_idx).available > buffer(pools.get(donor_idx).limit),
+            pools' = pools.set(donor_idx, { ...pools.get(donor_idx),
+                available: pools.get(donor_idx).available - 1,
+            }),
+            in_flight' = in_flight.set(pair, in_flight.get(pair) + 1),
+            total_limit' = total_limit,
+        }
     }
 
     /// Acquire a permit successfully: own pool first, then borrow from
@@ -314,8 +332,10 @@ module multi_pool {
     ///    lend to that waiter (permit stays in-flight, re-homed)
     /// 4. otherwise → return to home pool's available
     action return_permit = {
-        nondet permit = oneOf(permits)
-        val home = permit.home_pool
+        // Pick an active (home, user) pair to return.
+        nondet pair = oneOf(active_pairs)
+        val home = pair._1
+        val user = pair._2
         val hp = pools.get(home)
         if (hp.priority_reduction > 0) {
             // Case 1: consume the permit to satisfy a pending reduction.
@@ -323,41 +343,32 @@ module multi_pool {
                 pools' = pools.set(home, { ...hp,
                     priority_reduction: hp.priority_reduction - 1,
                 }),
-                permits' = permits.exclude(Set(permit)),
+                in_flight' = in_flight.set(pair, in_flight.get(pair) - 1),
                 total_limit' = total_limit,
-                next_id' = next_id,
             }
-        } else if (length(hp.queue) > 0) {
+        } else if (hp.queue_len > 0) {
             // Case 2: wake the home pool's front waiter. The permit
-            // transfers directly — one holder out, one holder in.
+            // transfers from returner to woken waiter.
             all {
                 pools' = pools.set(home, { ...hp,
-                    queue: tail(hp.queue),
+                    queue_len: hp.queue_len - 1,
                 }),
-                // Remove the old permit, add a new one for the woken waiter.
-                permits' = permits.exclude(Set(permit)).union(Set({
-                    id: next_id, home_pool: home, user_pool: home,
-                })),
-                next_id' = next_id + 1,
+                in_flight' = transfer_permit(pair, (home, home)),
                 total_limit' = total_limit,
             }
         } else if (hp.available >= buffer(hp.limit)) {
             // Case 3: home pool would have spare after return. Instead of
             // adding to available, lend to another pool's queued waiter.
-            // Non-deterministically pick which other pool to serve.
             val other_pools_with_waiters = POOL_INDICES.filter(i =>
-                i != home and length(pools.get(i).queue) > 0
+                i != home and pools.get(i).queue_len > 0
             )
             if (other_pools_with_waiters.size() > 0) {
                 nondet other = oneOf(other_pools_with_waiters)
-                val op = pools.get(other)
                 all {
-                    pools' = pools
-                        .set(other, { ...op, queue: tail(op.queue) }),
-                    permits' = permits.exclude(Set(permit)).union(Set({
-                        id: next_id, home_pool: home, user_pool: other,
-                    })),
-                    next_id' = next_id + 1,
+                    pools' = pools.set(other, { ...pools.get(other),
+                        queue_len: pools.get(other).queue_len - 1,
+                    }),
+                    in_flight' = transfer_permit(pair, (home, other)),
                     total_limit' = total_limit,
                 }
             } else {
@@ -366,9 +377,8 @@ module multi_pool {
                     pools' = pools.set(home, { ...hp,
                         available: hp.available + 1,
                     }),
-                    permits' = permits.exclude(Set(permit)),
+                    in_flight' = in_flight.set(pair, in_flight.get(pair) - 1),
                     total_limit' = total_limit,
-                    next_id' = next_id,
                 }
             }
         } else {
@@ -377,9 +387,8 @@ module multi_pool {
                 pools' = pools.set(home, { ...hp,
                     available: hp.available + 1,
                 }),
-                permits' = permits.exclude(Set(permit)),
+                in_flight' = in_flight.set(pair, in_flight.get(pair) - 1),
                 total_limit' = total_limit,
-                next_id' = next_id,
             }
         }
     }
@@ -397,12 +406,11 @@ module multi_pool {
         all {
             p.available == 0,
             no_donor,
-            length(p.queue) < MAX_QUEUE_SIZE,
+            p.queue_len < MAX_QUEUE_SIZE,
             pools' = pools.set(pool_idx, { ...p,
-                queue: p.queue.append(next_id),
+                queue_len: p.queue_len + 1,
             }),
-            permits' = permits,
-            next_id' = next_id + 1,
+            in_flight' = in_flight,
             total_limit' = total_limit,
         }
     }
@@ -413,15 +421,11 @@ module multi_pool {
         nondet pool_idx = oneOf(POOL_INDICES)
         val p = pools.get(pool_idx)
         all {
-            length(p.queue) > 0,
-            nondet idx = oneOf(indices(p.queue))
+            p.queue_len > 0,
             pools' = pools.set(pool_idx, { ...p,
-                queue: slice(p.queue, 0, idx).concat(
-                    slice(p.queue, idx + 1, length(p.queue))
-                ),
+                queue_len: p.queue_len - 1,
             }),
-            permits' = permits,
-            next_id' = next_id,
+            in_flight' = in_flight,
             total_limit' = total_limit,
         }
     }
@@ -433,12 +437,12 @@ module multi_pool {
     ///   If increasing: cancel priority reductions, wake waiters, add to available
     ///   If decreasing: consume available, remainder becomes priority_reduction
     action set_limit = {
-        nondet new_total = oneOf(0.to(2 * INITIAL_PERMITS))
+        nondet new_total = oneOf(1.to(2 * INITIAL_PERMITS))
         val new_dist = distribute(new_total, WEIGHTS)
-        // Fold over each pool, accumulating the updated pools map, new
-        // permits (from woken waiters), and the next_id counter.
+        // Fold over each pool, accumulating the updated pools map and
+        // in-flight counts (woken waiters get new permits).
         val result = POOL_INDICES.fold(
-            { new_pools: pools, new_permits: permits, nid: next_id },
+            { new_pools: pools, new_if: in_flight },
             (acc, i) => {
                 val p = pools.get(i)
                 val new_limit = new_dist.get(i)
@@ -447,27 +451,18 @@ module multi_pool {
                     // Increasing: cancel reductions, wake waiters, add to available
                     val cancel_reductions = min(delta, p.priority_reduction)
                     val after_cancel = delta - cancel_reductions
-                    val wake = min(after_cancel, length(p.queue))
+                    val wake = min(after_cancel, p.queue_len)
                     val add_available = after_cancel - wake
-                    // Create permits for woken waiters
-                    val woken_permits = 0.to(wake - 1).fold(
-                        { ps: acc.new_permits, id: acc.nid },
-                        (pacc, _) => {
-                            ps: pacc.ps.union(Set({
-                                id: pacc.id, home_pool: i, user_pool: i,
-                            })),
-                            id: pacc.id + 1,
-                        }
-                    )
+                    val home_pair = (i, i)
                     {
                         new_pools: acc.new_pools.set(i, { ...p,
                             limit: new_limit,
                             priority_reduction: p.priority_reduction - cancel_reductions,
-                            queue: slice(p.queue, wake, length(p.queue)),
+                            queue_len: p.queue_len - wake,
                             available: p.available + add_available,
                         }),
-                        new_permits: woken_permits.ps,
-                        nid: woken_permits.id,
+                        new_if: acc.new_if.set(home_pair,
+                            acc.new_if.get(home_pair) + wake),
                     }
                 } else if (delta < 0) {
                     // Decreasing: consume available, remainder → priority_reduction
@@ -480,23 +475,20 @@ module multi_pool {
                             available: p.available - consume,
                             priority_reduction: p.priority_reduction + new_reductions,
                         }),
-                        new_permits: acc.new_permits,
-                        nid: acc.nid,
+                        new_if: acc.new_if,
                     }
                 } else {
                     // delta == 0: just update limit (may differ due to rounding)
                     {
                         new_pools: acc.new_pools.set(i, { ...p, limit: new_limit }),
-                        new_permits: acc.new_permits,
-                        nid: acc.nid,
+                        new_if: acc.new_if,
                     }
                 }
             }
         )
         all {
             pools' = result.new_pools,
-            permits' = result.new_permits,
-            next_id' = result.nid,
+            in_flight' = result.new_if,
             total_limit' = new_total,
         }
     }
