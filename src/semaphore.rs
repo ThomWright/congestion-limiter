@@ -21,16 +21,25 @@ use bon::bon;
 use tokio::{sync::oneshot, time::Instant};
 
 #[derive(Debug)]
-struct WeightedSubQueue {
+struct Pool {
     weight: f64,
-    entries: VecDeque<QueueEntry>,
+    queue: VecDeque<QueueEntry>,
+    // Per-pool fields, unused until Phase 2.
+    #[allow(dead_code)]
+    limit: usize,
+    #[allow(dead_code)]
+    available: usize,
+    #[allow(dead_code)]
+    in_flight: usize,
+    #[allow(dead_code)]
+    priority_reduction: usize,
 }
 
 #[derive(Debug)]
 struct SemaphoreState {
     available: usize,
     priority_reduction: usize,
-    queues: Vec<WeightedSubQueue>,
+    pools: Vec<Pool>,
 }
 
 #[derive(Debug)]
@@ -58,6 +67,8 @@ struct EntryId {
 #[derive(Debug)]
 pub struct Permit {
     semaphore: Option<Arc<Semaphore>>,
+    home_pool: usize,
+    user_pool: usize,
 }
 
 struct Acquire {
@@ -100,11 +111,15 @@ impl Semaphore {
             state: Mutex::new(SemaphoreState {
                 available: initial_permits,
                 priority_reduction: 0,
-                queues: weights
+                pools: weights
                     .into_iter()
-                    .map(|w| WeightedSubQueue {
+                    .map(|w| Pool {
                         weight: w,
-                        entries: VecDeque::with_capacity(cap_per_queue),
+                        queue: VecDeque::with_capacity(cap_per_queue),
+                        limit: 0,
+                        available: 0,
+                        in_flight: 0,
+                        priority_reduction: 0,
                     })
                     .collect(),
             }),
@@ -127,6 +142,8 @@ impl Semaphore {
 
         Ok(Permit {
             semaphore: Some(Arc::clone(&self)),
+            home_pool: 0,
+            user_pool: 0,
         })
     }
 
@@ -146,21 +163,23 @@ impl Semaphore {
                 state.available -= 1;
                 return Ok(Permit {
                     semaphore: Some(Arc::clone(&self)),
+                    home_pool: 0,
+                    user_pool: 0,
                 });
             }
 
-            let total_len: usize = state.queues.iter().map(|q| q.entries.len()).sum();
+            let total_len: usize = state.pools.iter().map(|q| q.queue.len()).sum();
             if total_len >= self.max_queue_size {
                 return Err(AcquireError::QueueFull);
             }
 
             let (sender, receiver) = oneshot::channel();
-            let sub = &mut state.queues[queue_idx];
-            let id = match sub.entries.back() {
+            let sub = &mut state.pools[queue_idx];
+            let id = match sub.queue.back() {
                 Some(entry) => entry.id.next(),
                 _ => EntryId::default(),
             };
-            sub.entries.push_back(QueueEntry { id, sender });
+            sub.queue.push_back(QueueEntry { id, sender });
             drop(state);
 
             (receiver, id)
@@ -178,11 +197,11 @@ impl Semaphore {
     ///
     /// Priority = `weight * time_in_queue`. Scans the front of each sub-queue (O(p)) and pops
     /// from the winner. FIFO tiebreak: older entry (lower `EntryId`) wins.
-    fn dequeue_highest_priority(queues: &mut [WeightedSubQueue]) -> Option<QueueEntry> {
-        let best_idx = queues
+    fn dequeue_highest_priority(pools: &mut [Pool]) -> Option<QueueEntry> {
+        let best_idx = pools
             .iter()
             .enumerate()
-            .filter_map(|(qi, sub)| sub.entries.front().map(|e| (qi, sub.weight, e)))
+            .filter_map(|(qi, sub)| sub.queue.front().map(|e| (qi, sub.weight, e)))
             .max_by(|(_, wa, a), (_, wb, b)| {
                 let pa = wa * a.id.added.elapsed().as_secs_f64();
                 let pb = wb * b.id.added.elapsed().as_secs_f64();
@@ -191,7 +210,8 @@ impl Semaphore {
                     .then_with(|| b.id.cmp(&a.id)) // FIFO tiebreak: lower id = older = wins
             })
             .map(|(qi, _, _)| qi)?;
-        queues[best_idx].entries.pop_front()
+
+        pools[best_idx].queue.pop_front()
     }
 
     fn return_permit(self: Arc<Self>) {
@@ -203,10 +223,12 @@ impl Semaphore {
             return;
         }
 
-        if let Some(entry) = Self::dequeue_highest_priority(&mut state.queues) {
+        if let Some(entry) = Self::dequeue_highest_priority(&mut state.pools) {
             drop(state);
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
+                home_pool: 0,
+                user_pool: 0,
             }));
         } else {
             state.available += 1;
@@ -235,11 +257,11 @@ impl Semaphore {
         }
 
         // Wake up to to_add queued waiters.
-        let total_len: usize = state.queues.iter().map(|q| q.entries.len()).sum();
+        let total_len: usize = state.pools.iter().map(|q| q.queue.len()).sum();
         let to_wake = to_add.min(total_len);
         let mut woken = Vec::with_capacity(to_wake);
         for _ in 0..to_wake {
-            let entry = Self::dequeue_highest_priority(&mut state.queues)
+            let entry = Self::dequeue_highest_priority(&mut state.pools)
                 .expect("total_len > 0 implies at least one sub-queue has an entry");
             woken.push(entry);
         }
@@ -253,6 +275,8 @@ impl Semaphore {
         for entry in woken {
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
+                home_pool: 0,
+                user_pool: 0,
             }));
         }
     }
@@ -271,7 +295,7 @@ impl Semaphore {
 
     fn cancel(&self, id: EntryId, queue_idx: usize) {
         let mut state = self.state.lock().expect("lock should not be poisoned");
-        let entries = &mut state.queues[queue_idx].entries;
+        let entries = &mut state.pools[queue_idx].queue;
         if let Ok(index) = entries.binary_search_by_key(&id, |entry| entry.id) {
             entries.remove(index);
         }
@@ -281,17 +305,54 @@ impl Semaphore {
         self.closed.store(true, atomic::Ordering::Release);
 
         let mut state = self.state.lock().expect("lock should not be poisoned");
-        for sub in state.queues.iter_mut() {
-            for entry in sub.entries.drain(..) {
+        for sub in state.pools.iter_mut() {
+            for entry in sub.queue.drain(..) {
                 let _ = entry.sender.send(Err(AcquireError::Closed));
             }
         }
+    }
+
+    pub(crate) fn pool_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("lock should not be poisoned")
+            .pools
+            .len()
     }
 
     #[cfg(test)]
     fn priority_reduction(&self) -> usize {
         self.state.lock().expect("lock should not be poisoned").priority_reduction
     }
+}
+
+/// Distribute `total` across `weights.len()` buckets proportional to each weight,
+/// using the largest remainder method so the sum is exactly `total`.
+pub(crate) fn distribute(total: usize, weights: &[f64]) -> Vec<usize> {
+    assert!(!weights.is_empty());
+    let sum: f64 = weights.iter().sum();
+    assert!(sum > 0.0, "weights must sum to a positive value");
+
+    let exact: Vec<f64> = weights.iter().map(|w| (w / sum) * total as f64).collect();
+    let floors: Vec<usize> = exact.iter().map(|v| v.floor() as usize).collect();
+    let mut remainders: Vec<(usize, f64)> = exact
+        .iter()
+        .zip(floors.iter())
+        .enumerate()
+        .map(|(i, (e, f))| (i, e - *f as f64))
+        .collect();
+
+    let floor_sum: usize = floors.iter().sum();
+    let mut result = floors;
+    let deficit = total - floor_sum;
+
+    // Distribute remaining units to the buckets with the largest remainders.
+    remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    for &(i, _) in remainders.iter().take(deficit) {
+        result[i] += 1;
+    }
+
+    result
 }
 
 impl Drop for Semaphore {
@@ -339,6 +400,16 @@ impl Drop for Acquire {
     }
 }
 
+impl Permit {
+    pub fn home_pool(&self) -> usize {
+        self.home_pool
+    }
+
+    pub fn user_pool(&self) -> usize {
+        self.user_pool
+    }
+}
+
 impl Drop for Permit {
     fn drop(&mut self) {
         if let Some(semaphore) = self.semaphore.take() {
@@ -382,9 +453,9 @@ mod tests {
             .state
             .lock()
             .unwrap()
-            .queues
+            .pools
             .iter()
-            .map(|q| q.entries.len())
+            .map(|q| q.queue.len())
             .sum()
     }
 
@@ -938,5 +1009,35 @@ mod tests {
         w0.abort();
         tokio::task::yield_now().await;
         assert_eq!(queue_len(&semaphore), 0);
+    }
+
+    #[test]
+    fn distribute_even() {
+        assert_eq!(distribute(10, &[1.0, 1.0]), vec![5, 5]);
+    }
+
+    #[test]
+    fn distribute_weighted() {
+        // 1:3 ratio of 10 → exact 2.5, 7.5 → floors 2, 7 → tied remainders,
+        // stable sort gives the extra unit to idx 0 → [3, 7].
+        assert_eq!(distribute(10, &[1.0, 3.0]), vec![3, 7]);
+    }
+
+    #[test]
+    fn distribute_single() {
+        assert_eq!(distribute(5, &[1.0]), vec![5]);
+    }
+
+    #[test]
+    fn distribute_zero_total() {
+        assert_eq!(distribute(0, &[1.0, 2.0, 3.0]), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn distribute_sum_is_exact() {
+        let result = distribute(7, &[1.0, 1.0, 1.0]);
+        assert_eq!(result.iter().sum::<usize>(), 7);
+        // Each gets at least 2, two get 3
+        assert!(result.iter().all(|&v| v == 2 || v == 3));
     }
 }

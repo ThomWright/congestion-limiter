@@ -106,6 +106,10 @@ where
     }
 
     pub(crate) fn try_acquire(&self) -> Option<Permit> {
+        self.try_acquire_from_pool(0)
+    }
+
+    pub(crate) fn try_acquire_from_pool(&self, _pool_idx: usize) -> Option<Permit> {
         match Arc::clone(&self.semaphore).try_acquire() {
             Ok(permit) => {
                 self.inc_in_flight();
