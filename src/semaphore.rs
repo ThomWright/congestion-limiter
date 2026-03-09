@@ -12,7 +12,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     sync::{
-        atomic::{self, AtomicBool, AtomicUsize},
+        atomic::{self, AtomicBool},
         Arc, Mutex,
     },
 };
@@ -27,18 +27,16 @@ struct WeightedSubQueue {
 }
 
 #[derive(Debug)]
+struct SemaphoreState {
+    available: usize,
+    priority_reduction: usize,
+    queues: Vec<WeightedSubQueue>,
+}
+
+#[derive(Debug)]
 pub struct Semaphore {
-    available_permits: AtomicUsize,
-    queues: Mutex<Vec<WeightedSubQueue>>,
-    total_max_queue_size: usize,
-    /// Number of returning permits to silently consume rather than return to the pool or wake a
-    /// waiter. Checked before the queue in [`Semaphore::return_permit`], so these take priority
-    /// over queued waiters.
-    priority_reduction: AtomicUsize,
-    // The tokio implementation has a nice optimisation where the closed state is a bitmask over
-    // `available_permits` (a few bits are reserved for flags), so it can load the complete state
-    // atomically.
-    // TODO: would this be useful for us?
+    state: Mutex<SemaphoreState>,
+    max_queue_size: usize,
     closed: AtomicBool,
 }
 
@@ -97,48 +95,39 @@ impl Semaphore {
 
         // Avoid unbounded memory usage for very large max_queue_size.
         let cap_per_queue = max_queue_size.min(64);
+        let total_max_queue_size = max_queue_size.saturating_mul(weights.len());
         Self {
-            available_permits: AtomicUsize::new(initial_permits),
-            total_max_queue_size: max_queue_size * weights.len(),
-            queues: Mutex::new(
-                weights
+            state: Mutex::new(SemaphoreState {
+                available: initial_permits,
+                priority_reduction: 0,
+                queues: weights
                     .into_iter()
                     .map(|w| WeightedSubQueue {
                         weight: w,
                         entries: VecDeque::with_capacity(cap_per_queue),
                     })
                     .collect(),
-            ),
-            priority_reduction: AtomicUsize::new(0),
+            }),
+            max_queue_size: total_max_queue_size,
             closed: AtomicBool::new(false),
         }
     }
 
     pub fn try_acquire(self: Arc<Self>) -> Result<Permit, AcquireError> {
-        let mut available_permits = self.available_permits.load(atomic::Ordering::Acquire);
-        loop {
-            if self.closed.load(atomic::Ordering::Acquire) {
-                return Err(AcquireError::Closed);
-            }
-            if available_permits == 0 {
-                return Err(AcquireError::NoPermits);
-            }
-            match self.available_permits.compare_exchange(
-                available_permits,
-                available_permits - 1,
-                atomic::Ordering::AcqRel,
-                atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(Permit {
-                        semaphore: Some(Arc::clone(&self)),
-                    });
-                }
-                Err(permits) => {
-                    available_permits = permits;
-                }
-            }
+        if self.closed.load(atomic::Ordering::Acquire) {
+            return Err(AcquireError::Closed);
         }
+
+        let mut state = self.state.lock().expect("lock should not be poisoned");
+        if state.available == 0 {
+            return Err(AcquireError::NoPermits);
+        }
+        state.available -= 1;
+        drop(state);
+
+        Ok(Permit {
+            semaphore: Some(Arc::clone(&self)),
+        })
     }
 
     pub(crate) async fn acquire_timeout(
@@ -146,83 +135,42 @@ impl Semaphore {
         timeout: std::time::Duration,
         queue_idx: usize,
     ) -> Result<Permit, AcquireError> {
-        let mut available_permits = self.available_permits.load(atomic::Ordering::Acquire);
-        loop {
+        let (receiver, id) = {
             if self.closed.load(atomic::Ordering::Acquire) {
                 return Err(AcquireError::Closed);
             }
-            if available_permits == 0 {
-                let (receiver, id) = {
-                    let mut queues = self.queues.lock().expect("lock should not be poisoned");
 
-                    // Re-check under the lock: a concurrent return_permit may have incremented
-                    // available_permits after our load but before we locked the queues. If so,
-                    // grab the permit directly without queuing.
-                    let mut current = self.available_permits.load(atomic::Ordering::Acquire);
-                    loop {
-                        if current == 0 {
-                            break;
-                        }
-                        match self.available_permits.compare_exchange(
-                            current,
-                            current - 1,
-                            atomic::Ordering::AcqRel,
-                            atomic::Ordering::Acquire,
-                        ) {
-                            Ok(_) => {
-                                return Ok(Permit {
-                                    semaphore: Some(Arc::clone(&self)),
-                                });
-                            }
-                            Err(v) => current = v,
-                        }
-                    }
+            let mut state = self.state.lock().expect("lock should not be poisoned");
 
-                    let total_len: usize = queues.iter().map(|q| q.entries.len()).sum();
-                    if total_len >= self.total_max_queue_size {
-                        return Err(AcquireError::QueueFull);
-                    }
-                    let (sender, receiver) = oneshot::channel();
-
-                    let sub = &mut queues[queue_idx];
-                    let id = match sub.entries.back() {
-                        Some(entry) => entry.id.next(),
-                        _ => EntryId::default(),
-                    };
-                    sub.entries.push_back(QueueEntry { id, sender });
-                    drop(queues);
-
-                    (receiver, id)
-                };
-
-                let acquire = Acquire::new(Arc::clone(&self), receiver, id, queue_idx);
-                match tokio::time::timeout(timeout, acquire).await {
-                    Ok(Ok(permit)) => {
-                        return Ok(permit);
-                    }
-                    Ok(Err(e)) => {
-                        return Err(e);
-                    }
-                    Err(_elapsed) => {
-                        return Err(AcquireError::Timeout);
-                    }
-                }
+            if state.available > 0 {
+                state.available -= 1;
+                return Ok(Permit {
+                    semaphore: Some(Arc::clone(&self)),
+                });
             }
-            match self.available_permits.compare_exchange(
-                available_permits,
-                available_permits - 1,
-                atomic::Ordering::AcqRel,
-                atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Ok(Permit {
-                        semaphore: Some(Arc::clone(&self)),
-                    });
-                }
-                Err(permits) => {
-                    available_permits = permits;
-                }
+
+            let total_len: usize = state.queues.iter().map(|q| q.entries.len()).sum();
+            if total_len >= self.max_queue_size {
+                return Err(AcquireError::QueueFull);
             }
+
+            let (sender, receiver) = oneshot::channel();
+            let sub = &mut state.queues[queue_idx];
+            let id = match sub.entries.back() {
+                Some(entry) => entry.id.next(),
+                _ => EntryId::default(),
+            };
+            sub.entries.push_back(QueueEntry { id, sender });
+            drop(state);
+
+            (receiver, id)
+        };
+
+        let acquire = Acquire::new(Arc::clone(&self), receiver, id, queue_idx);
+        match tokio::time::timeout(timeout, acquire).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(AcquireError::Timeout),
         }
     }
 
@@ -247,35 +195,26 @@ impl Semaphore {
     }
 
     fn return_permit(self: Arc<Self>) {
-        // Priority: satisfy pending reductions before waking queued waiters.
-        let mut pending = self.priority_reduction.load(atomic::Ordering::Acquire);
-        while pending > 0 {
-            match self.priority_reduction.compare_exchange(
-                pending,
-                pending - 1,
-                atomic::Ordering::AcqRel,
-                atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => return, // permit consumed; not returned to pool or queue
-                Err(v) => pending = v,
-            }
+        let mut state = self.state.lock().expect("lock should not be poisoned");
+
+        if state.priority_reduction > 0 {
+            // Consume the permit to satisfy a pending reduction.
+            state.priority_reduction -= 1;
+            return;
         }
 
-        let mut queues = self.queues.lock().expect("lock should not be poisoned");
-        if let Some(entry) = Self::dequeue_highest_priority(&mut queues) {
-            drop(queues);
-
+        if let Some(entry) = Self::dequeue_highest_priority(&mut state.queues) {
+            drop(state);
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
             }));
         } else {
-            self.available_permits
-                .fetch_add(1, atomic::Ordering::Release);
+            state.available += 1;
         }
     }
 
     pub fn available_permits(&self) -> usize {
-        self.available_permits.load(atomic::Ordering::Acquire)
+        self.state.lock().expect("lock should not be poisoned").available
     }
 
     /// Increase the number of permits by `n`.
@@ -283,83 +222,56 @@ impl Semaphore {
     /// Cancels pending reductions first, then wakes queued waiters, then adds to the available
     /// pool.
     pub fn add_permits(self: Arc<Self>, n: usize) {
+        let mut state = self.state.lock().expect("lock should not be poisoned");
         let mut to_add = n;
 
         // Cancel pending reductions before giving permits to waiters or the pool.
-        let mut pending = self.priority_reduction.load(atomic::Ordering::Acquire);
-        while pending > 0 && to_add > 0 {
-            let to_cancel = to_add.min(pending);
-            match self.priority_reduction.compare_exchange(
-                pending,
-                pending - to_cancel,
-                atomic::Ordering::AcqRel,
-                atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    to_add -= to_cancel;
-                    pending -= to_cancel;
-                }
-                Err(v) => pending = v,
-            }
-        }
+        let cancel = to_add.min(state.priority_reduction);
+        state.priority_reduction -= cancel;
+        to_add -= cancel;
 
         if to_add == 0 {
             return;
         }
 
-        // Wake up to to_add queued waiters, then add any remaining to available_permits.
-        let mut queues = self.queues.lock().expect("lock should not be poisoned");
-        let total_len: usize = queues.iter().map(|q| q.entries.len()).sum();
+        // Wake up to to_add queued waiters.
+        let total_len: usize = state.queues.iter().map(|q| q.entries.len()).sum();
         let to_wake = to_add.min(total_len);
+        let mut woken = Vec::with_capacity(to_wake);
         for _ in 0..to_wake {
-            let entry = Self::dequeue_highest_priority(&mut queues)
+            let entry = Self::dequeue_highest_priority(&mut state.queues)
                 .expect("total_len > 0 implies at least one sub-queue has an entry");
+            woken.push(entry);
+        }
+
+        // Add any remaining to available.
+        let remaining = to_add - to_wake;
+        state.available += remaining;
+        drop(state);
+
+        // Send permits to woken waiters outside the lock.
+        for entry in woken {
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
             }));
-        }
-        let remaining = to_add - to_wake;
-        if remaining > 0 {
-            self.available_permits
-                .fetch_add(remaining, atomic::Ordering::Release);
         }
     }
 
     /// Decrease the number of permits by `n`.
     ///
-    /// Consumes available permits immediately; any remainder is recorded in [`priority_reduction`]
-    /// and consumed as in-flight permits are returned, taking priority over queued waiters.
+    /// Consumes available permits immediately; any remainder is recorded in
+    /// `priority_reduction` and consumed as in-flight permits are returned,
+    /// taking priority over queued waiters.
     pub fn decrease_permits(&self, n: usize) {
-        let mut remaining = n;
-
-        // Immediately consume as many available permits as possible.
-        let mut available = self.available_permits.load(atomic::Ordering::Acquire);
-        while remaining > 0 && available > 0 {
-            let to_take = remaining.min(available);
-            match self.available_permits.compare_exchange(
-                available,
-                available - to_take,
-                atomic::Ordering::AcqRel,
-                atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    remaining -= to_take;
-                    available -= to_take;
-                }
-                Err(v) => available = v,
-            }
-        }
-
-        // Schedule the rest to be consumed as in-flight permits are returned.
-        if remaining > 0 {
-            self.priority_reduction
-                .fetch_add(remaining, atomic::Ordering::Release);
-        }
+        let mut state = self.state.lock().expect("lock should not be poisoned");
+        let consume = n.min(state.available);
+        state.available -= consume;
+        state.priority_reduction += n - consume;
     }
 
     fn cancel(&self, id: EntryId, queue_idx: usize) {
-        let mut queues = self.queues.lock().expect("lock should not be poisoned");
-        let entries = &mut queues[queue_idx].entries;
+        let mut state = self.state.lock().expect("lock should not be poisoned");
+        let entries = &mut state.queues[queue_idx].entries;
         if let Ok(index) = entries.binary_search_by_key(&id, |entry| entry.id) {
             entries.remove(index);
         }
@@ -368,12 +280,17 @@ impl Semaphore {
     fn close(&self) {
         self.closed.store(true, atomic::Ordering::Release);
 
-        let mut queues = self.queues.lock().expect("lock should not be poisoned");
-        for sub in queues.iter_mut() {
+        let mut state = self.state.lock().expect("lock should not be poisoned");
+        for sub in state.queues.iter_mut() {
             for entry in sub.entries.drain(..) {
                 let _ = entry.sender.send(Err(AcquireError::Closed));
             }
         }
+    }
+
+    #[cfg(test)]
+    fn priority_reduction(&self) -> usize {
+        self.state.lock().expect("lock should not be poisoned").priority_reduction
     }
 }
 
@@ -462,9 +379,10 @@ mod tests {
 
     fn queue_len(semaphore: &Semaphore) -> usize {
         semaphore
-            .queues
+            .state
             .lock()
             .unwrap()
+            .queues
             .iter()
             .map(|q| q.entries.len())
             .sum()
@@ -751,23 +669,14 @@ mod tests {
 
         semaphore.decrease_permits(3); // consume 1 available immediately, 2 pending
         assert_eq!(semaphore.available_permits(), 0);
-        assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
-            2
-        );
+        assert_eq!(semaphore.priority_reduction(), 2);
 
         drop(p1); // satisfies 1 pending reduction
-        assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
-            1
-        );
+        assert_eq!(semaphore.priority_reduction(), 1);
         assert_eq!(semaphore.available_permits(), 0);
 
         drop(p2); // satisfies the last pending reduction
-        assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
-            0
-        );
+        assert_eq!(semaphore.priority_reduction(), 0);
         assert_eq!(semaphore.available_permits(), 0); // pool is now size 0
     }
 
@@ -826,7 +735,7 @@ mod tests {
 
         assert_eq!(semaphore.available_permits(), 2);
         assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            semaphore.priority_reduction(),
             0,
             "no pending reduction when permits were available"
         );
@@ -850,10 +759,7 @@ mod tests {
         semaphore.decrease_permits(4); // want to take 4, only 1 available
 
         assert_eq!(semaphore.available_permits(), 0);
-        assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
-            3
-        );
+        assert_eq!(semaphore.priority_reduction(), 3);
     }
 
     /// Returning a permit satisfies `priority_reduction` before waking a queued waiter.
@@ -876,17 +782,15 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(queue_len(&semaphore), 1);
 
-        // Record a priority reduction
-        semaphore
-            .priority_reduction
-            .store(1, atomic::Ordering::Release);
+        // Record a priority reduction via decrease_permits
+        semaphore.decrease_permits(1);
 
         // Return the permit: the reduction should consume it, not the waiter
         drop(p1);
         tokio::task::yield_now().await;
 
         assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            semaphore.priority_reduction(),
             0,
             "reduction should be satisfied"
         );
@@ -915,10 +819,7 @@ mod tests {
 
         // Record 3 pending reductions (e.g. from a limit decrease)
         semaphore.decrease_permits(3);
-        assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
-            3
-        );
+        assert_eq!(semaphore.priority_reduction(), 3);
 
         // Queue up a waiter
         let waiter = tokio::spawn({
@@ -931,7 +832,7 @@ mod tests {
         semaphore.clone().add_permits(2);
 
         assert_eq!(
-            semaphore.priority_reduction.load(atomic::Ordering::Acquire),
+            semaphore.priority_reduction(),
             1,
             "2 of 3 reductions should be cancelled"
         );
