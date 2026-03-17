@@ -174,6 +174,9 @@ impl WeightedSemaphore {
     /// Try to acquire a permit from `pool_idx`'s own pool, then by borrowing
     /// from a donor with spare capacity above its buffer threshold.
     ///
+    /// When multiple donors are eligible, the one with the lowest weight is preferred,
+    /// preserving capacity in higher-weight (higher-QoS) pools.
+    ///
     /// Returns `Some((home_pool, user_pool))` on success.
     fn try_acquire_inner(state: &mut SemaphoreState, pool_idx: usize) -> Option<(usize, usize)> {
         // Own pool
@@ -183,9 +186,15 @@ impl WeightedSemaphore {
             return Some((pool_idx, pool_idx));
         }
 
-        // Borrow from a donor with spare above buffer
+        // Borrow from the lowest-weight eligible donor.
         let donor = (0..state.pools.len())
-            .find(|&i| i != pool_idx && state.pools[i].available > buffer(state.pools[i].limit))?;
+            .filter(|&i| i != pool_idx && state.pools[i].available > buffer(state.pools[i].limit))
+            .min_by(|&a, &b| {
+                state.pools[a]
+                    .weight
+                    .partial_cmp(&state.pools[b].weight)
+                    .unwrap_or(Ordering::Equal)
+            })?;
 
         state.pools[donor].available -= 1;
         state.pools[pool_idx].in_flight += 1;
@@ -1117,6 +1126,32 @@ mod tests {
         w0.abort();
         tokio::task::yield_now().await;
         assert_eq!(queue_len(&semaphore), 0);
+    }
+
+    /// When multiple pools are eligible donors, the one with the lowest weight is chosen,
+    /// preserving capacity in higher-weight pools.
+    #[tokio::test]
+    async fn borrow_prefers_lowest_weight_donor() {
+        // Three pools: weights 1, 2, 3. distribute(6, [1,2,3]) → [1, 2, 3].
+        // buffer(1)=1, buffer(2)=1, buffer(3)=1.
+        // Pool 1 (weight=2) and pool 2 (weight=3) are above their buffers; pool 0 (weight=1) is not.
+        let semaphore = Arc::new(
+            WeightedSemaphore::builder()
+                .initial_permits(6)
+                .max_queue_size(0)
+                .weights(vec![1.0, 2.0, 3.0])
+                .build(),
+        );
+
+        // Exhaust pool 0 so it must borrow.
+        let _p0 = semaphore.clone().try_acquire(0).unwrap();
+
+        // Pool 0 is exhausted; eligible donors are pool 1 (available=2 > buffer(2)=1)
+        // and pool 2 (available=3 > buffer(3)=1). Pool 1 has the lower weight.
+        let borrowed = semaphore.clone().try_acquire(0).unwrap();
+
+        // The permit should be homed in pool 1, not pool 2.
+        assert_eq!(borrowed.home_pool, 1);
     }
 
     #[test]
