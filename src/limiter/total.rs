@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     fmt::Debug,
     sync::{atomic, Arc},
     time::Duration,
@@ -109,8 +108,8 @@ where
         self.try_acquire_from_pool(0)
     }
 
-    pub(crate) fn try_acquire_from_pool(&self, _pool_idx: usize) -> Option<Permit> {
-        match Arc::clone(&self.semaphore).try_acquire() {
+    pub(crate) fn try_acquire_from_pool(&self, pool_idx: usize) -> Option<Permit> {
+        match Arc::clone(&self.semaphore).try_acquire(pool_idx) {
             Ok(permit) => {
                 self.inc_in_flight();
                 Some(permit)
@@ -159,32 +158,13 @@ where
 
         let old_limit = self.limit.swap(new_limit, atomic::Ordering::SeqCst);
 
-        match new_limit.cmp(&old_limit) {
-            cmp::Ordering::Greater => {
-                Arc::clone(&self.semaphore).add_permits(new_limit - old_limit);
+        if new_limit != old_limit {
+            Arc::clone(&self.semaphore).set_limit(new_limit);
+        }
 
-                #[cfg(test)]
-                if let Some(n) = &self.notifier {
-                    n.notify_one();
-                }
-            }
-            cmp::Ordering::Less => {
-                // Consume available permits immediately; any remainder is consumed asynchronously
-                // as in-flight permits are returned, taking priority over queued waiters.
-                self.semaphore.decrease_permits(old_limit - new_limit);
-
-                #[cfg(test)]
-                if let Some(n) = &self.notifier {
-                    n.notify_one();
-                }
-            }
-            _ =>
-            {
-                #[cfg(test)]
-                if let Some(n) = &self.notifier {
-                    n.notify_one();
-                }
-            }
+        #[cfg(test)]
+        if let Some(n) = &self.notifier {
+            n.notify_one();
         }
 
         new_limit

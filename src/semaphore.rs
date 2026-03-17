@@ -24,21 +24,14 @@ use tokio::{sync::oneshot, time::Instant};
 struct Pool {
     weight: f64,
     queue: VecDeque<QueueEntry>,
-    // Per-pool fields, unused until Phase 2.
-    #[allow(dead_code)]
     limit: usize,
-    #[allow(dead_code)]
     available: usize,
-    #[allow(dead_code)]
     in_flight: usize,
-    #[allow(dead_code)]
     priority_reduction: usize,
 }
 
 #[derive(Debug)]
 struct SemaphoreState {
-    available: usize,
-    priority_reduction: usize,
     pools: Vec<Pool>,
 }
 
@@ -96,55 +89,74 @@ impl Semaphore {
     pub fn new(
         /// Initial number of permits in the pool.
         initial_permits: usize,
-        /// Maximum queue size for each sub-queue. The total max queue size is `max_queue_size * weights.len()`.
+        /// Maximum queue size per pool.
         max_queue_size: usize,
-        /// Weights for each sub-queue. Defaults to `[1.0]`.
+        /// Weights for each pool. Defaults to `[1.0]`.
         #[builder(default = vec![1.0])]
         weights: Vec<f64>,
     ) -> Self {
         assert!(!weights.is_empty(), "weights must not be empty");
 
-        // Avoid unbounded memory usage for very large max_queue_size.
+        let dist = distribute(initial_permits, &weights);
         let cap_per_queue = max_queue_size.min(64);
-        let total_max_queue_size = max_queue_size.saturating_mul(weights.len());
         Self {
             state: Mutex::new(SemaphoreState {
-                available: initial_permits,
-                priority_reduction: 0,
                 pools: weights
                     .into_iter()
-                    .map(|w| Pool {
+                    .enumerate()
+                    .map(|(i, w)| Pool {
                         weight: w,
                         queue: VecDeque::with_capacity(cap_per_queue),
-                        limit: 0,
-                        available: 0,
+                        limit: dist[i],
+                        available: dist[i],
                         in_flight: 0,
                         priority_reduction: 0,
                     })
                     .collect(),
             }),
-            max_queue_size: total_max_queue_size,
+            max_queue_size,
             closed: AtomicBool::new(false),
         }
     }
 
-    pub fn try_acquire(self: Arc<Self>) -> Result<Permit, AcquireError> {
+    pub(crate) fn try_acquire(self: Arc<Self>, pool_idx: usize) -> Result<Permit, AcquireError> {
         if self.closed.load(atomic::Ordering::Acquire) {
             return Err(AcquireError::Closed);
         }
 
         let mut state = self.state.lock().expect("lock should not be poisoned");
-        if state.available == 0 {
-            return Err(AcquireError::NoPermits);
+        match Self::try_acquire_inner(&mut state, pool_idx) {
+            Some((home, user)) => {
+                drop(state);
+                Ok(Permit {
+                    semaphore: Some(Arc::clone(&self)),
+                    home_pool: home,
+                    user_pool: user,
+                })
+            }
+            None => Err(AcquireError::NoPermits),
         }
-        state.available -= 1;
-        drop(state);
+    }
 
-        Ok(Permit {
-            semaphore: Some(Arc::clone(&self)),
-            home_pool: 0,
-            user_pool: 0,
-        })
+    /// Try to acquire a permit from `pool_idx`'s own pool, then by borrowing
+    /// from a donor with spare capacity above its buffer threshold.
+    ///
+    /// Returns `Some((home_pool, user_pool))` on success.
+    fn try_acquire_inner(state: &mut SemaphoreState, pool_idx: usize) -> Option<(usize, usize)> {
+        // Own pool
+        if state.pools[pool_idx].available > 0 {
+            state.pools[pool_idx].available -= 1;
+            state.pools[pool_idx].in_flight += 1;
+            return Some((pool_idx, pool_idx));
+        }
+
+        // Borrow from a donor with spare above buffer
+        let donor = (0..state.pools.len())
+            .find(|&i| i != pool_idx && state.pools[i].available > buffer(state.pools[i].limit))?;
+
+        state.pools[donor].available -= 1;
+        state.pools[pool_idx].in_flight += 1;
+        Some((donor, pool_idx))
     }
 
     pub(crate) async fn acquire_timeout(
@@ -159,17 +171,17 @@ impl Semaphore {
 
             let mut state = self.state.lock().expect("lock should not be poisoned");
 
-            if state.available > 0 {
-                state.available -= 1;
+            // Fast path: try own pool or borrow
+            if let Some((home, user)) = Self::try_acquire_inner(&mut state, queue_idx) {
+                drop(state);
                 return Ok(Permit {
                     semaphore: Some(Arc::clone(&self)),
-                    home_pool: 0,
-                    user_pool: 0,
+                    home_pool: home,
+                    user_pool: user,
                 });
             }
 
-            let total_len: usize = state.pools.iter().map(|q| q.queue.len()).sum();
-            if total_len >= self.max_queue_size {
+            if state.pools[queue_idx].queue.len() >= self.max_queue_size {
                 return Err(AcquireError::QueueFull);
             }
 
@@ -193,11 +205,13 @@ impl Semaphore {
         }
     }
 
-    /// Dequeue the highest-priority entry across all sub-queues.
+    /// Dequeue the highest-priority entry across all pools.
     ///
-    /// Priority = `weight * time_in_queue`. Scans the front of each sub-queue (O(p)) and pops
+    /// Priority = `weight * time_in_queue`. Scans the front of each pool's queue (O(p)) and pops
     /// from the winner. FIFO tiebreak: older entry (lower `EntryId`) wins.
-    fn dequeue_highest_priority(pools: &mut [Pool]) -> Option<QueueEntry> {
+    ///
+    /// Returns `(pool_index, entry)`.
+    fn dequeue_highest_priority(pools: &mut [Pool]) -> Option<(usize, QueueEntry)> {
         let best_idx = pools
             .iter()
             .enumerate()
@@ -211,86 +225,126 @@ impl Semaphore {
             })
             .map(|(qi, _, _)| qi)?;
 
-        pools[best_idx].queue.pop_front()
+        pools[best_idx].queue.pop_front().map(|e| (best_idx, e))
     }
 
-    fn return_permit(self: Arc<Self>) {
+    /// Return a permit to its home pool. Four outcomes, checked in order:
+    ///
+    /// 1. Home pool has `priority_reduction > 0` → consume (permit destroyed).
+    /// 2. Home pool's queue has a waiter → wake it (permit stays in-flight).
+    /// 3. Home pool has spare capacity and another pool has a queued waiter →
+    ///    lend to that waiter (permit stays in-flight, re-homed).
+    /// 4. Otherwise → return to home pool's available.
+    fn return_permit(self: Arc<Self>, home: usize, user: usize) {
         let mut state = self.state.lock().expect("lock should not be poisoned");
 
-        if state.priority_reduction > 0 {
-            // Consume the permit to satisfy a pending reduction.
-            state.priority_reduction -= 1;
+        // Always decrement user pool's in_flight.
+        state.pools[user].in_flight -= 1;
+
+        // Case 1: consume to satisfy a pending reduction.
+        if state.pools[home].priority_reduction > 0 {
+            state.pools[home].priority_reduction -= 1;
             return;
         }
 
-        if let Some(entry) = Self::dequeue_highest_priority(&mut state.pools) {
+        // Case 2: wake home pool's front waiter.
+        if !state.pools[home].queue.is_empty() {
+            let entry = state.pools[home].queue.pop_front().unwrap();
+            state.pools[home].in_flight += 1;
             drop(state);
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
-                home_pool: 0,
-                user_pool: 0,
+                home_pool: home,
+                user_pool: home,
             }));
-        } else {
-            state.available += 1;
-        }
-    }
-
-    pub fn available_permits(&self) -> usize {
-        self.state.lock().expect("lock should not be poisoned").available
-    }
-
-    /// Increase the number of permits by `n`.
-    ///
-    /// Cancels pending reductions first, then wakes queued waiters, then adds to the available
-    /// pool.
-    pub fn add_permits(self: Arc<Self>, n: usize) {
-        let mut state = self.state.lock().expect("lock should not be poisoned");
-        let mut to_add = n;
-
-        // Cancel pending reductions before giving permits to waiters or the pool.
-        let cancel = to_add.min(state.priority_reduction);
-        state.priority_reduction -= cancel;
-        to_add -= cancel;
-
-        if to_add == 0 {
             return;
         }
 
-        // Wake up to to_add queued waiters.
-        let total_len: usize = state.pools.iter().map(|q| q.queue.len()).sum();
-        let to_wake = to_add.min(total_len);
-        let mut woken = Vec::with_capacity(to_wake);
-        for _ in 0..to_wake {
-            let entry = Self::dequeue_highest_priority(&mut state.pools)
-                .expect("total_len > 0 implies at least one sub-queue has an entry");
-            woken.push(entry);
+        // Case 3: home pool has spare — lend to another pool's waiter.
+        // Home's queue is empty (case 2 was false), so dequeue_highest_priority
+        // will only pick from other pools.
+        if state.pools[home].available >= buffer(state.pools[home].limit) {
+            if let Some((waiter_pool, entry)) = Self::dequeue_highest_priority(&mut state.pools) {
+                state.pools[waiter_pool].in_flight += 1;
+                drop(state);
+                let _ = entry.sender.send(Ok(Permit {
+                    semaphore: Some(Arc::clone(&self)),
+                    home_pool: home,
+                    user_pool: waiter_pool,
+                }));
+                return;
+            }
         }
 
-        // Add any remaining to available.
-        let remaining = to_add - to_wake;
-        state.available += remaining;
+        // Case 4: return to home pool's available.
+        state.pools[home].available += 1;
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.state
+            .lock()
+            .expect("lock should not be poisoned")
+            .pools
+            .iter()
+            .map(|p| p.available)
+            .sum()
+    }
+
+    /// Set the total permit limit, redistributing across pools proportionally.
+    ///
+    /// For each pool, given its new target limit:
+    /// - If increasing: cancel priority reductions, wake waiters, add to available.
+    /// - If decreasing: consume available immediately, remainder → priority_reduction.
+    pub(crate) fn set_limit(self: Arc<Self>, new_total: usize) {
+        let mut state = self.state.lock().expect("lock should not be poisoned");
+        let weights: Vec<f64> = state.pools.iter().map(|p| p.weight).collect();
+        let new_dist = distribute(new_total, &weights);
+
+        // Collect waiters to wake outside the lock: (pool_idx, entry).
+        let mut to_wake: Vec<(usize, QueueEntry)> = Vec::new();
+
+        for (i, pool) in state.pools.iter_mut().enumerate() {
+            let new_limit = new_dist[i];
+            let delta = new_limit.cast_signed() - pool.limit.cast_signed();
+            pool.limit = new_limit;
+
+            if delta > 0 {
+                let delta = delta.cast_unsigned();
+                // Cancel pending reductions first.
+                let cancel = delta.min(pool.priority_reduction);
+                pool.priority_reduction -= cancel;
+                let after_cancel = delta - cancel;
+
+                // Wake waiters from this pool's queue.
+                let wake = after_cancel.min(pool.queue.len());
+                for _ in 0..wake {
+                    let entry = pool.queue.pop_front().unwrap();
+                    pool.in_flight += 1;
+                    to_wake.push((i, entry));
+                }
+
+                // Remainder goes to available.
+                pool.available += after_cancel - wake;
+            } else if delta < 0 {
+                let abs_delta = (-delta).cast_unsigned();
+                // Consume available immediately.
+                let consume = abs_delta.min(pool.available);
+                pool.available -= consume;
+                // Remainder becomes priority_reduction.
+                pool.priority_reduction += abs_delta - consume;
+            }
+        }
+
         drop(state);
 
         // Send permits to woken waiters outside the lock.
-        for entry in woken {
+        for (pool_idx, entry) in to_wake {
             let _ = entry.sender.send(Ok(Permit {
                 semaphore: Some(Arc::clone(&self)),
-                home_pool: 0,
-                user_pool: 0,
+                home_pool: pool_idx,
+                user_pool: pool_idx,
             }));
         }
-    }
-
-    /// Decrease the number of permits by `n`.
-    ///
-    /// Consumes available permits immediately; any remainder is recorded in
-    /// `priority_reduction` and consumed as in-flight permits are returned,
-    /// taking priority over queued waiters.
-    pub fn decrease_permits(&self, n: usize) {
-        let mut state = self.state.lock().expect("lock should not be poisoned");
-        let consume = n.min(state.available);
-        state.available -= consume;
-        state.priority_reduction += n - consume;
     }
 
     fn cancel(&self, id: EntryId, queue_idx: usize) {
@@ -312,18 +366,23 @@ impl Semaphore {
         }
     }
 
-    pub(crate) fn pool_count(&self) -> usize {
+    #[cfg(test)]
+    fn priority_reduction(&self) -> usize {
         self.state
             .lock()
             .expect("lock should not be poisoned")
             .pools
-            .len()
+            .iter()
+            .map(|p| p.priority_reduction)
+            .sum()
     }
+}
 
-    #[cfg(test)]
-    fn priority_reduction(&self) -> usize {
-        self.state.lock().expect("lock should not be poisoned").priority_reduction
-    }
+/// Buffer threshold for a pool: 10% of the limit (rounded up).
+///
+/// A pool must keep at least this many permits available before lending to others.
+pub(crate) fn buffer(limit: usize) -> usize {
+    limit.div_ceil(10)
 }
 
 /// Distribute `total` across `weights.len()` buckets proportional to each weight,
@@ -334,6 +393,11 @@ pub(crate) fn distribute(total: usize, weights: &[f64]) -> Vec<usize> {
     assert!(sum > 0.0, "weights must sum to a positive value");
 
     let exact: Vec<f64> = weights.iter().map(|w| (w / sum) * total as f64).collect();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "weights are non-negative so floor() is always non-negative and fits in usize"
+    )]
     let floors: Vec<usize> = exact.iter().map(|v| v.floor() as usize).collect();
     let mut remainders: Vec<(usize, f64)> = exact
         .iter()
@@ -400,20 +464,10 @@ impl Drop for Acquire {
     }
 }
 
-impl Permit {
-    pub fn home_pool(&self) -> usize {
-        self.home_pool
-    }
-
-    pub fn user_pool(&self) -> usize {
-        self.user_pool
-    }
-}
-
 impl Drop for Permit {
     fn drop(&mut self) {
         if let Some(semaphore) = self.semaphore.take() {
-            semaphore.return_permit();
+            semaphore.return_permit(self.home_pool, self.user_pool);
         }
     }
 }
@@ -468,13 +522,13 @@ mod tests {
                 .build(),
         );
         {
-            let p1 = semaphore.clone().try_acquire();
+            let p1 = semaphore.clone().try_acquire(0);
             assert!(p1.is_ok());
 
-            let p2 = semaphore.clone().try_acquire();
+            let p2 = semaphore.clone().try_acquire(0);
             assert!(p2.is_err());
         }
-        let p = semaphore.try_acquire();
+        let p = semaphore.clone().try_acquire(0);
         assert!(p.is_ok());
     }
 
@@ -486,7 +540,7 @@ mod tests {
                 .max_queue_size(1)
                 .build(),
         );
-        let p1 = semaphore.clone().try_acquire().unwrap();
+        let p1 = semaphore.clone().try_acquire(0).unwrap();
         let acquired = Arc::new(Mutex::new(false));
         let acquire_task = tokio::spawn({
             let acquired = acquired.clone();
@@ -514,7 +568,7 @@ mod tests {
                 .build(),
         );
         // Acquire and hold the only permit
-        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
         let acquire_task = tokio::spawn({
             let semaphore = semaphore.clone();
             async move {
@@ -539,7 +593,7 @@ mod tests {
         );
 
         // Acquire and hold the only permit
-        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
 
         // Queue up two acquires
         let acquire_task1 = tokio::spawn({
@@ -571,7 +625,7 @@ mod tests {
                 .build(),
         );
 
-        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
         let acquire_task = tokio::spawn({
             let semaphore = semaphore.clone();
             async move { semaphore.acquire_timeout(Duration::from_secs(1), 0).await }
@@ -594,7 +648,7 @@ mod tests {
         );
         semaphore.close();
 
-        let res = semaphore.clone().try_acquire();
+        let res = semaphore.clone().try_acquire(0);
         assert_matches!(res, Err(AcquireError::Closed));
 
         let res = semaphore.acquire_timeout(Duration::from_secs(1), 0).await;
@@ -612,7 +666,7 @@ mod tests {
                 .build(),
         );
 
-        let p1 = semaphore.clone().try_acquire().unwrap();
+        let p1 = semaphore.clone().try_acquire(0).unwrap();
 
         // Queue up a waiter
         let waiter = tokio::spawn({
@@ -641,7 +695,7 @@ mod tests {
                 .max_queue_size(1)
                 .build(),
         );
-        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
 
         // First waiter fills the queue
         let _waiter = tokio::spawn({
@@ -656,9 +710,9 @@ mod tests {
         assert_matches!(res, Err(AcquireError::QueueFull));
     }
 
-    /// `add_permits` wakes exactly as many queued waiters as new permits added.
+    /// `set_limit` increasing wakes exactly as many queued waiters as new permits added.
     #[tokio::test(start_paused = true)]
-    async fn add_permits_wakes_waiters() {
+    async fn set_limit_increase_wakes_waiters() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .initial_permits(1)
@@ -667,7 +721,7 @@ mod tests {
         );
 
         // Fill up all permits
-        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
 
         // Queue up 2 waiters
         let waiter1 = tokio::spawn({
@@ -681,12 +735,10 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(queue_len(&semaphore), 2);
 
-        // Add 2 permits: both waiters should be woken, nothing left in available.
-        semaphore.clone().add_permits(2);
+        // Increase limit from 1 to 3: both waiters should be woken.
+        semaphore.clone().set_limit(3);
         tokio::task::yield_now().await;
 
-        // Check while tasks still hold their permits (before awaiting them, which drops the
-        // permits and returns them to the pool).
         assert_eq!(semaphore.available_permits(), 0);
         assert_eq!(queue_len(&semaphore), 0);
 
@@ -694,9 +746,9 @@ mod tests {
         assert!(waiter2.await.unwrap().is_ok());
     }
 
-    /// `add_permits` with more permits than waiters puts the surplus into available_permits.
+    /// `set_limit` increasing with more permits than waiters puts the surplus into available.
     #[tokio::test(start_paused = true)]
-    async fn add_permits_surplus_goes_to_available() {
+    async fn set_limit_increase_surplus_goes_to_available() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .initial_permits(2)
@@ -705,8 +757,8 @@ mod tests {
         );
 
         // Hold both permits
-        let _p1 = semaphore.clone().try_acquire().unwrap();
-        let _p2 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
+        let _p2 = semaphore.clone().try_acquire(0).unwrap();
 
         // Queue up 1 waiter
         let waiter = tokio::spawn({
@@ -715,18 +767,17 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        // Add 3 permits: 1 goes to the waiter, 2 remain available.
-        semaphore.clone().add_permits(3);
+        // Increase limit from 2 to 5: 1 goes to the waiter, 2 remain available.
+        semaphore.clone().set_limit(5);
         tokio::task::yield_now().await;
 
-        // Check while waiter still holds its permit.
         assert_eq!(semaphore.available_permits(), 2);
         assert!(waiter.await.unwrap().is_ok());
     }
 
     /// Returning an in-flight permit satisfies `priority_reduction`, shrinking the pool.
     #[tokio::test]
-    async fn decrease_permits_consumed_as_in_flight_return() {
+    async fn priority_reduction_consumed_on_return() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .initial_permits(3)
@@ -734,11 +785,12 @@ mod tests {
                 .build(),
         );
 
-        let p1 = semaphore.clone().try_acquire().unwrap();
-        let p2 = semaphore.clone().try_acquire().unwrap();
+        let p1 = semaphore.clone().try_acquire(0).unwrap();
+        let p2 = semaphore.clone().try_acquire(0).unwrap();
         // 1 available, 2 in-flight
 
-        semaphore.decrease_permits(3); // consume 1 available immediately, 2 pending
+        // Decrease limit from 3 to 0: consume 1 available immediately, 2 pending
+        semaphore.clone().set_limit(0);
         assert_eq!(semaphore.available_permits(), 0);
         assert_eq!(semaphore.priority_reduction(), 2);
 
@@ -761,7 +813,7 @@ mod tests {
                 .build(),
         );
 
-        let p1 = semaphore.clone().try_acquire().unwrap();
+        let p1 = semaphore.clone().try_acquire(0).unwrap();
 
         let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -792,9 +844,9 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
     }
 
-    /// `decrease_permits` immediately consumes available permits.
+    /// `set_limit` decrease immediately consumes available permits.
     #[tokio::test]
-    async fn decrease_permits_consumes_available_immediately() {
+    async fn set_limit_decrease_consumes_available() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .initial_permits(5)
@@ -802,7 +854,7 @@ mod tests {
                 .build(),
         );
 
-        semaphore.decrease_permits(3);
+        semaphore.clone().set_limit(2);
 
         assert_eq!(semaphore.available_permits(), 2);
         assert_eq!(
@@ -812,10 +864,10 @@ mod tests {
         );
     }
 
-    /// `decrease_permits` records the remainder in `priority_reduction` when not enough permits
+    /// `set_limit` decrease records the remainder in `priority_reduction` when not enough permits
     /// are immediately available.
     #[tokio::test]
-    async fn decrease_permits_sets_priority_reduction_for_remainder() {
+    async fn set_limit_decrease_sets_priority_reduction() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .initial_permits(3)
@@ -823,14 +875,15 @@ mod tests {
                 .build(),
         );
 
-        let _p1 = semaphore.clone().try_acquire().unwrap();
-        let _p2 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
+        let _p2 = semaphore.clone().try_acquire(0).unwrap();
         // 1 available, 2 in-flight
 
-        semaphore.decrease_permits(4); // want to take 4, only 1 available
+        // Decrease from 3 to 0: consume 1 available, 2 pending
+        semaphore.clone().set_limit(0);
 
         assert_eq!(semaphore.available_permits(), 0);
-        assert_eq!(semaphore.priority_reduction(), 3);
+        assert_eq!(semaphore.priority_reduction(), 2);
     }
 
     /// Returning a permit satisfies `priority_reduction` before waking a queued waiter.
@@ -843,7 +896,7 @@ mod tests {
                 .build(),
         );
 
-        let p1 = semaphore.clone().try_acquire().unwrap();
+        let p1 = semaphore.clone().try_acquire(0).unwrap();
 
         // A waiter joins the queue
         let waiter = tokio::spawn({
@@ -853,8 +906,8 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(queue_len(&semaphore), 1);
 
-        // Record a priority reduction via decrease_permits
-        semaphore.decrease_permits(1);
+        // Record a priority reduction via set_limit decrease
+        semaphore.clone().set_limit(0);
 
         // Return the permit: the reduction should consume it, not the waiter
         drop(p1);
@@ -872,9 +925,9 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
-    /// `add_permits` cancels pending reductions rather than giving permits to waiters or the pool.
+    /// `set_limit` increase cancels pending reductions before waking waiters or adding to available.
     #[tokio::test(start_paused = true)]
-    async fn add_permits_cancels_pending_reductions() {
+    async fn set_limit_increase_cancels_pending_reductions() {
         let semaphore = Arc::new(
             Semaphore::builder()
                 .initial_permits(4)
@@ -883,13 +936,13 @@ mod tests {
         );
 
         // Hold all 4 permits
-        let _p1 = semaphore.clone().try_acquire().unwrap();
-        let _p2 = semaphore.clone().try_acquire().unwrap();
-        let _p3 = semaphore.clone().try_acquire().unwrap();
-        let _p4 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
+        let _p2 = semaphore.clone().try_acquire(0).unwrap();
+        let _p3 = semaphore.clone().try_acquire(0).unwrap();
+        let _p4 = semaphore.clone().try_acquire(0).unwrap();
 
-        // Record 3 pending reductions (e.g. from a limit decrease)
-        semaphore.decrease_permits(3);
+        // Decrease limit from 4 to 1: 3 pending reductions
+        semaphore.clone().set_limit(1);
         assert_eq!(semaphore.priority_reduction(), 3);
 
         // Queue up a waiter
@@ -899,8 +952,8 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        // Add 2 permits: should cancel 2 reductions, not wake the waiter
-        semaphore.clone().add_permits(2);
+        // Increase limit from 1 to 3: should cancel 2 reductions, not wake the waiter
+        semaphore.clone().set_limit(3);
 
         assert_eq!(
             semaphore.priority_reduction(),
@@ -918,30 +971,41 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
-    /// With two sub-queues of different weights, the higher-weight waiter is served first even
+    /// With two pools of different weights, the higher-weight waiter is served first even
     /// when the lower-weight waiter has been in the queue longer.
     #[tokio::test(start_paused = true)]
     async fn priority_ordering() {
+        // distribute(20, [1.0, 10.0]) → [2, 18]. buffer(18) = 2.
+        // We hold 19, leaving pool 1 with available=1 (above buffer after return).
         let semaphore = Arc::new(
             Semaphore::builder()
-                .initial_permits(1)
+                .initial_permits(20)
                 .max_queue_size(2)
                 .weights(vec![1.0, 10.0])
                 .build(),
         );
 
-        let p1 = semaphore.clone().try_acquire().unwrap();
+        // Hold 19 permits: 2 from pool 0, 17 from pool 1.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(semaphore.clone().try_acquire(0).unwrap());
+        }
+        for _ in 0..17 {
+            held.push(semaphore.clone().try_acquire(1).unwrap());
+        }
+        // Pool 0: available=0. Pool 1: available=1.
+        // Take the last available permit (pool 1) — this is the one we'll return.
+        let p1 = semaphore.clone().try_acquire(1).unwrap();
 
         let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Queue a waiter in sub-queue 0 (weight 1.0).
+        // Queue a waiter in pool 0 (weight 1.0).
         let w0 = tokio::spawn({
             let semaphore = semaphore.clone();
             let order = order.clone();
             async move {
                 let _p = semaphore.acquire_timeout(Duration::MAX, 0).await.unwrap();
                 order.lock().unwrap().push(0u32);
-                // _p dropped here, waking the next waiter
             }
         });
         tokio::task::yield_now().await;
@@ -949,7 +1013,7 @@ mod tests {
         // Advance so w0 has been waiting 5ms.
         tokio::time::advance(Duration::from_millis(5)).await;
 
-        // Queue a waiter in sub-queue 1 (weight 10.0).
+        // Queue a waiter in pool 1 (weight 10.0).
         let w1 = tokio::spawn({
             let semaphore = semaphore.clone();
             let order = order.clone();
@@ -961,12 +1025,23 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Advance another 5ms. Now:
-        //   sub-queue 0: weight=1.0,  waited=10ms → priority = 0.010
-        //   sub-queue 1: weight=10.0, waited=5ms  → priority = 0.050  ← wins
+        //   pool 0: weight=1.0,  waited=10ms → priority = 0.010
+        //   pool 1: weight=10.0, waited=5ms  → priority = 0.050  ← wins
         tokio::time::advance(Duration::from_millis(5)).await;
 
+        // Drop p1 (home_pool=1). Case 2: pool 1 has a waiter (w1) → wake w1.
         drop(p1);
         w1.await.unwrap();
+
+        // w1's permit is dropped. home_pool=1, pool 1 queue empty (case 2 false).
+        // Case 3: pool 1 available(0) >= buffer(18)=2 → false. Falls to case 4.
+        // w0 won't be served unless we free more permits.
+        // Drop one of the held permits (home_pool=1) to give pool 1 spare.
+        drop(held.pop()); // returns to pool 1
+        drop(held.pop()); // returns to pool 1, now available=2 >= buffer=2
+
+        // Next return should trigger case 3 and lend to w0.
+        drop(held.pop());
         w0.await.unwrap();
 
         assert_eq!(*order.lock().unwrap(), vec![1, 0]);
@@ -984,7 +1059,7 @@ mod tests {
                 .build(),
         );
 
-        let _p1 = semaphore.clone().try_acquire().unwrap();
+        let _p1 = semaphore.clone().try_acquire(0).unwrap();
 
         // Queue a waiter in sub-queue 0 — should survive.
         let w0 = tokio::spawn({

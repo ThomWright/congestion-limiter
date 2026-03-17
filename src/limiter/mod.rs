@@ -21,7 +21,6 @@ mod token;
 mod total;
 
 type CapacityUnit = usize;
-type CapacityUnitNeg = isize;
 type AtomicCapacityUnit = AtomicUsize;
 
 /// Limits the number of concurrent jobs.

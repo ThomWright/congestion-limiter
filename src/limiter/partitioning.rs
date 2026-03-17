@@ -4,19 +4,15 @@ use std::{
     time::Duration,
 };
 
-use bon::bon;
-use conv::{ConvAsUtil, ConvUtil};
-
 use crate::semaphore::Permit;
+use bon::bon;
 
 use crate::{
     limiter::{Outcome, Token},
     limits::LimitAlgorithm,
 };
 
-use super::{
-    AtomicCapacityUnit, CapacityUnit, CapacityUnitNeg, LimiterState, Releaser, TotalLimiter,
-};
+use super::{AtomicCapacityUnit, CapacityUnit, LimiterState, Releaser, TotalLimiter};
 
 type StateIndex = usize;
 
@@ -152,19 +148,12 @@ where
     }
 
     fn try_acquire(self: &Arc<Self>, index: StateIndex) -> Option<Permit> {
-        let partition = &self.partition_states[index];
-
-        let total_limit = self.total_limiter.limit();
-        if partition.has_capacity_available(total_limit) || self.has_spare_capacity(total_limit) {
-            match self.total_limiter.try_acquire() {
-                Some(permit) => {
-                    self.partition_states[index].inc_in_flight();
-                    Some(permit)
-                }
-                None => None,
+        match self.total_limiter.try_acquire_from_pool(index) {
+            Some(permit) => {
+                self.partition_states[index].inc_in_flight();
+                Some(permit)
             }
-        } else {
-            None
+            None => None,
         }
     }
 
@@ -190,17 +179,6 @@ where
     ) -> CapacityUnit {
         self.total_limiter.update_limit(outcome, latency).await
     }
-
-    /// Total spare capacity which can be used by any partition.
-    fn spare_capacity(&self, total_limit: CapacityUnit) -> CapacityUnitNeg {
-        self.partition_states.iter().fold(0, |total, partition| {
-            total + partition.spare_capacity(total_limit)
-        })
-    }
-
-    fn has_spare_capacity(&self, total_limit: CapacityUnit) -> bool {
-        self.spare_capacity(total_limit) > 0
-    }
 }
 
 #[async_trait::async_trait]
@@ -218,20 +196,19 @@ impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
 }
 
 impl PartitionState {
-    const BUFFER_FRACTION: f64 = 0.1;
-
     fn state(&self, total_limit: CapacityUnit) -> LimiterState {
-        let limit = self.limit(total_limit);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "fraction is in [0,1] so the product is non-negative and bounded by total_limit"
+        )]
+        let limit = (total_limit as f64 * self.fraction).ceil() as CapacityUnit;
         let in_flight = self.in_flight();
         LimiterState {
             limit,
             in_flight,
             available: limit.saturating_sub(in_flight),
         }
-    }
-
-    fn limit(&self, total_limit: CapacityUnit) -> CapacityUnit {
-        fractional_limit(total_limit, self.fraction)
     }
 
     fn inc_in_flight(&self) -> CapacityUnit {
@@ -245,47 +222,6 @@ impl PartitionState {
     fn in_flight(&self) -> CapacityUnit {
         self.in_flight.load(atomic::Ordering::SeqCst)
     }
-
-    /// Spare capacity which can be used by other partitions.
-    ///
-    /// Can be negative when:
-    /// 1. capacity is being borrowed from another partition.
-    /// 2. the total limit has been reduced.
-    fn spare_capacity(&self, total_limit: CapacityUnit) -> CapacityUnitNeg {
-        let partition_limit = self.limit(total_limit);
-        let buffer = (partition_limit as f64 * Self::BUFFER_FRACTION)
-            .ceil()
-            .approx_as::<CapacityUnitNeg>()
-            .expect("should be < usize::MAX");
-
-        let spare = partition_limit
-            .approx_as::<CapacityUnitNeg>()
-            .expect("should be < isize::MAX")
-            - self
-                .in_flight()
-                .approx_as::<CapacityUnitNeg>()
-                .expect("should be < isize::MAX");
-
-        // Keep a buffer just for this partition, to grow into if we need it.
-        if spare > 0 {
-            (spare - buffer).max(0)
-        } else {
-            spare
-        }
-    }
-
-    fn has_capacity_available(&self, total_limit: CapacityUnit) -> bool {
-        self.in_flight() < self.limit(total_limit)
-    }
-}
-
-fn fractional_limit(limit: CapacityUnit, fraction: f64) -> CapacityUnit {
-    let limit_f64 = limit as f64 * fraction;
-
-    limit_f64
-        .ceil()
-        .approx()
-        .expect("should be clamped within usize bounds")
 }
 
 #[cfg(test)]
@@ -458,16 +394,23 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn priority_ordering() {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
-        mock_algo.set_limit(1);
+        // distribute(20, [1.0, 10.0]) → [2, 18]. buffer(18) = 2.
+        mock_algo.set_limit(20);
 
-        // Partition 0: weight 1 (fraction 1/11)
-        // Partition 1: weight 10 (fraction 10/11)
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
             .weights(vec![1.0, 10.0])
             .build();
 
-        let t0 = partitions[0].try_acquire().unwrap();
+        // Exhaust all permits from partition 1.
+        let mut held = Vec::new();
+        while let Some(t) = partitions[1].try_acquire() {
+            held.push(t);
+        }
+        // Also take partition 0's permits.
+        while let Some(t) = partitions[0].try_acquire() {
+            held.push(t);
+        }
 
         let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -478,12 +421,10 @@ mod tests {
             async move {
                 let _t = p.acquire_timeout(Duration::MAX).await.unwrap();
                 order.lock().unwrap().push(0u32);
-                // _t dropped here, waking the next waiter
             }
         });
-        tokio::task::yield_now().await; // let w0 enter the queue
+        tokio::task::yield_now().await;
 
-        // Advance time so w0 has been waiting 5ms.
         tokio::time::advance(Duration::from_millis(5)).await;
 
         // Queue a waiter for the high-weight partition 1.
@@ -495,17 +436,18 @@ mod tests {
                 order.lock().unwrap().push(1u32);
             }
         });
-        tokio::task::yield_now().await; // let w1 enter the queue
+        tokio::task::yield_now().await;
 
-        // Advance time another 5ms. Now:
         //   w0: weight=1/11, waited=10ms  → priority ≈ 0.00091
         //   w1: weight=10/11, waited=5ms  → priority ≈ 0.0045  ← wins
         tokio::time::advance(Duration::from_millis(5)).await;
 
-        // Release the permit. The semaphore serves the highest-priority waiter.
-        drop(t0);
+        // Drop all held permits. Returns go to home pools.
+        // Pool 1's waiter (w1) is served first via case 2 (home pool has waiter).
+        // Pool 0's waiter (w0) is served later when a pool-0 permit returns.
+        drop(held);
+        tokio::task::yield_now().await;
 
-        // w1 should be served first; after it drops its token w0 gets served.
         w1.await.unwrap();
         w0.await.unwrap();
 
