@@ -31,11 +31,11 @@
   - [x] Rejection delay
     - Option to add delay before rejecting jobs. Intended to slow down clients, e.g. RabbitMQ retries.
   - [ ] Fractional limits – e.g. 0.5 allows 1 job every other RTT
-  - [ ] Static partitioning
+  - [x] Static partitioning
   - [ ] Dynamic partitioning?
     - How possible would it be to partition somewhat dynamically? E.g. on customer IDs?
-  - [ ] LIFO for jobs waiting for a token
-    - Optimise for latency
+  - [ ] FIFO/LIFO/Adaptive queue ordering per pool
+    - See docs/queue-ordering.md for design
 - [x] Documentation
   - [x] README
     - [x] Examples
