@@ -1,11 +1,20 @@
-//! A semaphore implementation.
+//! A weighted multi-pool semaphore.
 //!
-//! It aims to solve two problems with tokio's semaphore:
+//! Unlike a standard semaphore, capacity is divided across indexed *pools*, each with its own
+//! weight, limit, and priority queue. This enables:
 //!
-//! 1. No limit on queue size. This can lead to an unbounded number of jobs in the system.
-//! 2. No control over queue prioritisation strategy. It is always FIFO.
-//!
-//! This won't be as optimised as tokio's semaphore, but it should be good enough for our use case.
+//! - **Weighted fairness**: waiters are woken in order of `weight × time_in_queue`, so
+//!   higher-weight pools are preferred without completely starving lower-weight ones.
+//! - **Bounded queuing**: each pool has a configurable maximum queue depth; excess callers
+//!   receive an immediate [`AcquireError::QueueFull`] rather than waiting indefinitely.
+//! - **Cross-pool borrowing**: when a pool exhausts its own permits, it can borrow from a
+//!   donor pool that holds more than its [buffer] threshold. This lets idle capacity flow to
+//!   wherever it is needed without permanently reallocating limits.
+//! - **Return routing**: when a borrowed permit is released, it is returned to its *home* pool
+//!   rather than the pool that used it, preserving the allocation invariants over time.
+//! - **Dynamic limit changes**: [`WeightedSemaphore::set_limit`] redistributes the total across
+//!   pools proportionally; increases wake waiters and cancel pending reductions, decreases consume
+//!   available permits and defer to [`Pool::priority_reduction`] for any remainder.
 
 use std::{
     cmp::Ordering,
@@ -20,13 +29,26 @@ use std::{
 use bon::bon;
 use tokio::{sync::oneshot, time::Instant};
 
+/// One partition of the semaphore's total capacity.
+///
+/// Each pool owns a slice of the total permit budget (its `limit`), tracks how many are
+/// currently in use (`in_flight`) or waiting (`queue`), and records any pending capacity
+/// reductions (`priority_reduction`) that haven't yet been absorbed by returning permits.
 #[derive(Debug)]
 struct Pool {
+    /// Relative weight used for priority scheduling and capacity distribution.
     weight: f64,
+    /// Waiters blocked on this pool.
     queue: VecDeque<QueueEntry>,
+    /// This pool's share of the total limit.
     limit: usize,
+    /// Permits available to be acquired immediately.
     available: usize,
+    /// Number of permits currently held by callers whose `user_pool` is this pool.
     in_flight: usize,
+    /// Permits that must be absorbed (destroyed) before the pool grows `available` again.
+    ///
+    /// Set when the total limit decreases faster than in-flight permits are returned.
     priority_reduction: usize,
 }
 
@@ -35,9 +57,11 @@ struct SemaphoreState {
     pools: Vec<Pool>,
 }
 
+/// A weighted multi-pool semaphore. See the [module documentation](self) for an overview.
 #[derive(Debug)]
-pub struct Semaphore {
+pub struct WeightedSemaphore {
     state: Mutex<SemaphoreState>,
+    /// Maximum number of waiters per pool.
     max_queue_size: usize,
     closed: AtomicBool,
 }
@@ -57,20 +81,29 @@ struct EntryId {
     discriminator: usize,
 }
 
+/// A permit granting the holder the right to proceed with one concurrent operation.
+///
+/// Dropping the permit returns it to the semaphore. The permit remembers which pool originally
+/// *owned* the capacity (`home_pool`) and which pool the caller *acquired* on behalf of
+/// (`user_pool`); on drop, capacity is routed back to the home pool rather than the user pool.
 #[derive(Debug)]
 pub struct Permit {
-    semaphore: Option<Arc<Semaphore>>,
+    semaphore: Option<Arc<WeightedSemaphore>>,
+    /// The pool whose capacity was consumed (the donor, or the user's own pool).
     home_pool: usize,
+    /// The pool on whose behalf the permit was acquired.
     user_pool: usize,
 }
 
+/// A future that resolves once a queued acquire completes or is cancelled.
 struct Acquire {
     id: EntryId,
     queue_idx: usize,
     receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
-    semaphore: Arc<Semaphore>,
+    semaphore: Arc<WeightedSemaphore>,
 }
 
+/// Errors returned by [`WeightedSemaphore::try_acquire`] and [`WeightedSemaphore::acquire_timeout`].
 #[derive(Debug, thiserror::Error)]
 pub enum AcquireError {
     #[error("No permits available")]
@@ -84,7 +117,7 @@ pub enum AcquireError {
 }
 
 #[bon]
-impl Semaphore {
+impl WeightedSemaphore {
     #[builder]
     pub fn new(
         /// Initial number of permits in the pool.
@@ -419,7 +452,7 @@ pub(crate) fn distribute(total: usize, weights: &[f64]) -> Vec<usize> {
     result
 }
 
-impl Drop for Semaphore {
+impl Drop for WeightedSemaphore {
     fn drop(&mut self) {
         self.close();
     }
@@ -427,7 +460,7 @@ impl Drop for Semaphore {
 
 impl Acquire {
     fn new(
-        semaphore: Arc<Semaphore>,
+        semaphore: Arc<WeightedSemaphore>,
         receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
         id: EntryId,
         queue_idx: usize,
@@ -502,7 +535,7 @@ mod tests {
 
     use super::*;
 
-    fn queue_len(semaphore: &Semaphore) -> usize {
+    fn queue_len(semaphore: &WeightedSemaphore) -> usize {
         semaphore
             .state
             .lock()
@@ -516,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn try_acquire() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -535,7 +568,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -562,7 +595,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_times_out() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -586,7 +619,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_removes_from_queue_when_dropped() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(2)
                 .build(),
@@ -619,7 +652,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acquire_timeout_errors_when_semaphore_closed() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -641,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_errs_when_closed() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -660,7 +693,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn queued_acquire_does_not_double_return_permit() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -690,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn queue_full_error() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -714,7 +747,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn set_limit_increase_wakes_waiters() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(3)
                 .build(),
@@ -750,7 +783,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn set_limit_increase_surplus_goes_to_available() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(2)
                 .max_queue_size(1)
                 .build(),
@@ -779,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn priority_reduction_consumed_on_return() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(3)
                 .max_queue_size(0)
                 .build(),
@@ -807,7 +840,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fifo_ordering() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(3)
                 .build(),
@@ -848,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn set_limit_decrease_consumes_available() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(5)
                 .max_queue_size(0)
                 .build(),
@@ -869,7 +902,7 @@ mod tests {
     #[tokio::test]
     async fn set_limit_decrease_sets_priority_reduction() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(3)
                 .max_queue_size(0)
                 .build(),
@@ -890,7 +923,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn return_permit_satisfies_priority_reduction_before_queue() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(1)
                 .build(),
@@ -929,7 +962,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn set_limit_increase_cancels_pending_reductions() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(4)
                 .max_queue_size(2)
                 .build(),
@@ -978,7 +1011,7 @@ mod tests {
         // distribute(20, [1.0, 10.0]) → [2, 18]. buffer(18) = 2.
         // We hold 19, leaving pool 1 with available=1 (above buffer after return).
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(20)
                 .max_queue_size(2)
                 .weights(vec![1.0, 10.0])
@@ -1052,7 +1085,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_targets_correct_sub_queue() {
         let semaphore = Arc::new(
-            Semaphore::builder()
+            WeightedSemaphore::builder()
                 .initial_permits(1)
                 .max_queue_size(2)
                 .weights(vec![1.0, 1.0])

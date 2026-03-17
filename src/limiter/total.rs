@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     limits::{LimitAlgorithm, Sample},
-    semaphore::{AcquireError, Permit, Semaphore},
+    semaphore::{AcquireError, Permit, WeightedSemaphore},
 };
 
 use super::{AtomicCapacityUnit, CapacityUnit, Outcome};
@@ -15,7 +15,7 @@ use super::{AtomicCapacityUnit, CapacityUnit, Outcome};
 #[derive(Debug)]
 pub(crate) struct TotalLimiter<T> {
     limit_algo: T,
-    semaphore: Arc<Semaphore>,
+    semaphore: Arc<WeightedSemaphore>,
     limit: AtomicCapacityUnit,
 
     /// Best-effort consistency
@@ -36,7 +36,7 @@ where
         TotalLimiter {
             limit_algo,
             semaphore: Arc::new(
-                Semaphore::builder()
+                WeightedSemaphore::builder()
                     .initial_permits(initial_permits)
                     .max_queue_size(max_queue_size)
                     .build(),
@@ -56,7 +56,7 @@ where
         TotalLimiter {
             limit_algo,
             semaphore: Arc::new(
-                Semaphore::builder()
+                WeightedSemaphore::builder()
                     .initial_permits(initial_permits)
                     .max_queue_size(max_queue_size)
                     .weights(weights)
