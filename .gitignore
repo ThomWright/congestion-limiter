@@ -3,6 +3,8 @@
 /_apalache-out
 tmp
 
+worktrees
+
 # Generated TLA+ and TLC output
 spec/*.tla
 spec/states/
@@ -11,3 +13,5 @@ spec/states/
 !spec/Apalache.tla
 !spec/Variants.tla
 !spec/multi_pool_tlc.tla
+
+output
