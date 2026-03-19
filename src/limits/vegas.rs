@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use rand::Rng;
 
 use crate::{limiter::Outcome, limits::defaults};
 
@@ -21,10 +22,20 @@ use super::{aimd::multiplicative_decrease, defaults::MIN_SAMPLE_LATENCY, LimitAl
 /// Estimates queuing delay by comparing the current latency with the minimum observed latency to
 /// estimate the number of jobs being queued.
 ///
-/// For greater stability consider wrapping with a percentile window sampler. This calculates a
-/// percentile (e.g. P90) over a period of time and provides that as a sample. Vegas then compares
-/// recent P90 latency with the minimum observed P90. Used this way, Vegas can handle heterogeneous
-/// workloads, as long as the percentile latency is fairly stable.
+/// # Baseline latency requirement
+///
+/// Vegas uses the minimum observed latency as a proxy for "no-load" latency. This works well when
+/// the no-load latency is stable — as in TCP, where the base RTT is essentially deterministic
+/// (propagation delay over a fixed path). It works poorly when service latency has high intrinsic
+/// variance: even under light load, the minimum observed sample is just the lucky tail of a wide
+/// distribution, not a meaningful floor. Normal completions then look like they carry queueing
+/// delay, causing spurious limit decreases.
+///
+/// **For services with high latency variance, always wrap with a percentile window sampler.**
+/// This aggregates individual samples into a stable percentile (e.g. P90) over a time window.
+/// Vegas then compares recent P90 with the minimum *observed P90*, which is far more stable than
+/// the minimum individual sample. As long as the windowed percentile is reasonably stable, Vegas
+/// can distinguish genuine congestion from natural variance.
 ///
 /// Can fairly distribute concurrency between independent clients as long as there is enough server
 /// capacity to handle the requests. That is: as long as the server isn't overloaded and failing to
@@ -48,6 +59,13 @@ pub struct Vegas {
     /// Upper queueing threshold, as a function of the current limit.
     beta: Box<dyn (Fn(usize) -> f64) + Send + Sync>,
 
+    /// Controls how often the baseline latency is probed.
+    ///
+    /// A probe fires every `probe_jitter * probe_multiplier * limit` samples. On a probe, the
+    /// baseline is reset to the current sample's latency and the limit is left unchanged. This
+    /// prevents the all-time minimum from drifting arbitrarily low over long runs.
+    probe_multiplier: usize,
+
     limit: AtomicUsize,
     inner: Mutex<Inner>,
 }
@@ -58,6 +76,14 @@ struct Inner {
     ///
     /// This is the latency we would expect to see if there is no congestion.
     base_latency: Duration,
+
+    /// Number of samples received since the last probe.
+    samples_since_probe: usize,
+
+    /// Jitter applied to the probe interval to desynchronise probes across independent clients.
+    ///
+    /// Random value in `[0.5, 1.0)`, resampled after each probe.
+    probe_jitter: f64,
 }
 
 impl Vegas {
@@ -69,6 +95,9 @@ impl Vegas {
 
     /// Utilisation needs to be above this to increase the limit.
     const DEFAULT_INCREASE_MIN_UTILISATION: f64 = 0.8;
+
+    /// Default probe multiplier. A probe fires every `~probe_multiplier * limit` samples.
+    const DEFAULT_PROBE_MULTIPLIER: usize = 30;
 
     #[allow(missing_docs)]
     pub fn new_with_initial_limit(initial_limit: usize) -> Self {
@@ -102,8 +131,12 @@ impl Vegas {
                 Self::DEFAULT_BETA_MULTIPLIER * (limit as f64).log10().max(1_f64)
             }),
 
+            probe_multiplier: Self::DEFAULT_PROBE_MULTIPLIER,
+
             inner: Mutex::new(Inner {
                 base_latency: Duration::MAX,
+                samples_since_probe: 0,
+                probe_jitter: rand::thread_rng().gen_range(0.5..1.0),
             }),
         }
     }
@@ -172,15 +205,27 @@ impl LimitAlgorithm for Vegas {
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        let current_limit = self.limit.load(Ordering::Acquire);
+        inner.samples_since_probe += 1;
+        let probe_interval = (inner.probe_jitter
+            * self.probe_multiplier as f64
+            * current_limit as f64) as usize;
+        if inner.samples_since_probe >= probe_interval {
+            // Probe: reset the baseline to the current sample and leave the limit unchanged.
+            // This prevents the all-time minimum from drifting arbitrarily low over long runs.
+            inner.base_latency = sample.latency;
+            inner.samples_since_probe = 0;
+            inner.probe_jitter = rand::thread_rng().gen_range(0.5..1.0);
+            return current_limit;
+        }
+
         if sample.latency < inner.base_latency {
             // Record a baseline "no load" latency and keep the limit.
             inner.base_latency = sample.latency;
-            // return self.limit.load(Ordering::Acquire);
+            return self.limit.load(Ordering::Acquire);
         }
 
         let update_limit = |limit: usize| {
-            // TODO: periodically reset baseline latency measurement.
-
             let actual_rate = sample.in_flight as f64 / sample.latency.as_secs_f64();
 
             let extra_latency = sample.latency.as_secs_f64() - inner.base_latency.as_secs_f64();
