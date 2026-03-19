@@ -73,27 +73,65 @@ pub async fn run(sim: &Simulation) -> Metrics {
                     None
                 };
 
-                // Try server.
-                match sim.server.try_accept(&mut rng) {
-                    None => {
-                        // Server limiter rejected.
-                        if let Some(t) = client_token {
-                            t.set_outcome(Outcome::Overload).await;
-                        }
-                        metrics.record_rejection(now, client_id, RequestOutcome::ServerRejected);
-                    }
-                    Some((server_token, latency)) => {
-                        queue.push(Reverse(ScheduledEvent {
-                            time: now + latency,
-                            event: Event::Complete {
+                // Try server, then database (if present).
+                // client_token is either consumed on rejection or moved into the tuple on acceptance.
+                let accepted = if let Some(db) = &sim.database {
+                    match sim.server.try_acquire() {
+                        None => {
+                            if let Some(t) = client_token {
+                                t.set_outcome(Outcome::Overload).await;
+                            }
+                            metrics.record_rejection(
+                                now,
                                 client_id,
-                                start_time: now,
-                                client_token,
-                                server_token,
-                                server_outcome: sim.server.sample_outcome(elapsed, &mut rng),
-                            },
-                        }));
+                                RequestOutcome::ServerRejected,
+                            );
+                            None
+                        }
+                        Some(server_token) => {
+                            let db_latency = db.start_request(&mut rng);
+                            let timeout = sim.server.db_timeout.unwrap_or(Duration::MAX);
+                            let timed_out = db_latency > timeout;
+                            let outcome = if timed_out {
+                                Outcome::Overload
+                            } else {
+                                sim.server.sample_outcome(elapsed, &mut rng)
+                            };
+                            Some((server_token, client_token, db_latency.min(timeout), outcome, true))
+                        }
                     }
+                } else {
+                    match sim.server.try_accept(&mut rng) {
+                        None => {
+                            if let Some(t) = client_token {
+                                t.set_outcome(Outcome::Overload).await;
+                            }
+                            metrics.record_rejection(
+                                now,
+                                client_id,
+                                RequestOutcome::ServerRejected,
+                            );
+                            None
+                        }
+                        Some((server_token, latency)) => {
+                            let outcome = sim.server.sample_outcome(elapsed, &mut rng);
+                            Some((server_token, client_token, latency, outcome, false))
+                        }
+                    }
+                };
+
+                if let Some((server_token, client_token, latency, outcome, has_db)) = accepted {
+                    queue.push(Reverse(ScheduledEvent {
+                        time: now + latency,
+                        event: Event::Complete {
+                            client_id,
+                            start_time: now,
+                            client_token,
+                            server_token,
+                            server_outcome: outcome,
+                            has_db,
+                        },
+                    }));
                 }
 
                 snapshot_all(now, sim, &mut metrics);
@@ -114,7 +152,11 @@ pub async fn run(sim: &Simulation) -> Metrics {
                 client_token,
                 server_token,
                 server_outcome,
+                has_db,
             } => {
+                if has_db {
+                    sim.database.as_ref().unwrap().finish_request();
+                }
                 if let Some(t) = server_token {
                     t.set_outcome(server_outcome).await;
                 }
@@ -165,5 +207,8 @@ fn snapshot_all(now: Instant, sim: &Simulation, metrics: &mut Metrics) {
     }
     if let Some(state) = sim.server.limiter_state() {
         metrics.snapshot_limiter(now, "server", state);
+    }
+    if let Some(db) = &sim.database {
+        metrics.snapshot_gauge(now, "database", db.in_flight(), db.workers);
     }
 }

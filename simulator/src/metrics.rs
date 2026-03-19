@@ -94,6 +94,16 @@ impl Metrics {
         });
     }
 
+    pub fn snapshot_gauge(&mut self, now: Instant, node: &str, in_flight: usize, capacity: usize) {
+        self.snapshots.push(LimiterSnapshot {
+            time_s: self.elapsed_s(now),
+            node: node.to_owned(),
+            limit: capacity,
+            in_flight,
+            available: capacity.saturating_sub(in_flight),
+        });
+    }
+
     fn elapsed_s(&self, now: Instant) -> f64 {
         now.duration_since(self.start).as_secs_f64()
     }

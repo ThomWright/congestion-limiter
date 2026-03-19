@@ -21,7 +21,8 @@ Available scenarios:
 |----------------------------|--------------------------------------------------------------|
 | `basic`                    | Single client (AIMD), constant load at ~2× server capacity   |
 | `step_load_vegas`          | Single client (raw Vegas), load steps up then down           |
-| `step_load_windowed_vegas` | Single client (windowed Vegas, P90), load steps up then down |
+| `step_load_windowed_vegas` | Single client (windowed Vegas, P50), load steps up then down |
+| `step_load_gradient`       | Single client (Gradient), load steps up then down            |
 
 Output is written to `output/<scenario>/`.
 

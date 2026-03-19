@@ -39,13 +39,16 @@ impl FailureRate {
 
 /// A server that processes requests with a configurable latency and failure rate.
 pub struct Server {
+    /// Latency distribution used when there is no database (direct server latency).
     pub latency: Erlang,
     pub failure_rate: FailureRate,
+    /// Timeout applied to database queries. Exceeded queries return `Overload`.
+    pub db_timeout: Option<Duration>,
     pub limiter: Option<Arc<Limiter<LimitAlgo>>>,
 }
 
 impl Server {
-    /// Try to accept a request.
+    /// Try to accept a request, sampling latency from `server.latency`.
     ///
     /// Returns `None` if the server's limiter rejected the request.
     /// Returns `Some((token, latency))` if accepted; `token` is `None` when there is no
@@ -55,6 +58,17 @@ impl Server {
         match &self.limiter {
             Some(limiter) => limiter.try_acquire().map(|t| (Some(t), latency)),
             None => Some((None, latency)),
+        }
+    }
+
+    /// Try to acquire a permit from the server's limiter without sampling latency.
+    ///
+    /// Used when latency comes from the database rather than the server itself.
+    /// Returns `None` if rejected, `Some(token)` if accepted (`None` token when unlimitied).
+    pub fn try_acquire(&self) -> Option<Option<Token>> {
+        match &self.limiter {
+            Some(limiter) => limiter.try_acquire().map(Some),
+            None => Some(None),
         }
     }
 

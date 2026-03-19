@@ -1,5 +1,6 @@
 mod algo;
 mod client;
+mod database;
 mod engine;
 mod event;
 mod load;
@@ -15,6 +16,7 @@ use statrs::distribution::Erlang;
 
 use algo::LimitAlgo;
 use client::Client;
+use database::Database;
 use load::LoadPattern;
 use server::{FailureRate, Server};
 use simulation::Simulation;
@@ -44,11 +46,16 @@ fn main() {
 
     let sim = match scenario {
         "basic" => basic(seed),
+        "step_load_aimd" => step_load_aimd(seed),
+        "step_load_windowed_aimd" => step_load_windowed_aimd(seed),
         "step_load_vegas" => step_load_vegas(seed),
         "step_load_windowed_vegas" => step_load_windowed_vegas(seed),
+        "step_load_gradient" => step_load_gradient(seed),
+        "step_load_windowed_gradient" => step_load_windowed_gradient(seed),
+        "multi_client" => multi_client(seed),
         other => {
             eprintln!("Unknown scenario: {other}");
-            eprintln!("Available scenarios: basic, step_load_vegas, step_load_windowed_vegas");
+            eprintln!("Available scenarios: basic, step_load_aimd, step_load_windowed_aimd, step_load_vegas, step_load_windowed_vegas, step_load_gradient, step_load_windowed_gradient, multi_client");
             std::process::exit(1);
         }
     };
@@ -91,11 +98,39 @@ fn basic(seed: u64) -> Simulation {
         server: Server {
             // Mean latency ~200 ms (Erlang k=2, rate=10 → mean = k/rate = 0.2 s)
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
-            failure_rate: FailureRate::Constant(0.01),
+            failure_rate: FailureRate::Constant(0.001),
+            db_timeout: None,
             limiter: None,
         },
+        database: None,
         seed,
     }
+}
+
+/// One client with raw AIMD, server without a limiter. Load steps up then down.
+fn step_load_aimd(seed: u64) -> Simulation {
+    use congestion_limiter::limits::Aimd;
+
+    let limiter = Limiter::builder()
+        .limit_algo(LimitAlgo::Aimd(Aimd::new_with_initial_limit(10)))
+        .build();
+
+    step_load_sim(seed, limiter)
+}
+
+/// One client with windowed AIMD (P50 aggregation), server without a limiter. Load steps up then
+/// down.
+fn step_load_windowed_aimd(seed: u64) -> Simulation {
+    use congestion_limiter::{aggregation::Percentile, limits::{Aimd, Windowed}};
+
+    let algo = Windowed::new(Aimd::new_with_initial_limit(10), Percentile::default())
+        .with_min_window(Duration::from_millis(100))
+        .with_max_window(Duration::from_secs(5));
+    let limiter = Limiter::builder()
+        .limit_algo(LimitAlgo::WindowedAimd(algo))
+        .build();
+
+    step_load_sim(seed, limiter)
 }
 
 /// One client with raw Vegas, server without a limiter. Load steps up then down.
@@ -112,7 +147,7 @@ fn step_load_vegas(seed: u64) -> Simulation {
     step_load_sim(seed, limiter)
 }
 
-/// One client with windowed Vegas (P90 aggregation), server without a limiter. Load steps up then
+/// One client with windowed Vegas (P50 aggregation), server without a limiter. Load steps up then
 /// down.
 ///
 /// The percentile window stabilises the baseline latency estimate, allowing Vegas to correctly
@@ -120,9 +155,36 @@ fn step_load_vegas(seed: u64) -> Simulation {
 fn step_load_windowed_vegas(seed: u64) -> Simulation {
     use congestion_limiter::{aggregation::Percentile, limits::{Vegas, Windowed}};
 
-    let algo = Windowed::new(Vegas::new_with_initial_limit(10), Percentile::default());
+    let algo = Windowed::new(Vegas::new_with_initial_limit(10), Percentile::default())
+        .with_min_window(Duration::from_millis(100))
+        .with_max_window(Duration::from_secs(5));
     let limiter = Limiter::builder()
         .limit_algo(LimitAlgo::WindowedVegas(algo))
+        .build();
+
+    step_load_sim(seed, limiter)
+}
+
+fn step_load_gradient(seed: u64) -> Simulation {
+    use congestion_limiter::limits::Gradient;
+
+    let limiter = Limiter::builder()
+        .limit_algo(LimitAlgo::Gradient(Gradient::new_with_initial_limit(10)))
+        .build();
+
+    step_load_sim(seed, limiter)
+}
+
+/// One client with windowed Gradient (P50 aggregation), server without a limiter. Load steps up
+/// then down.
+fn step_load_windowed_gradient(seed: u64) -> Simulation {
+    use congestion_limiter::{aggregation::Percentile, limits::{Gradient, Windowed}};
+
+    let algo = Windowed::new(Gradient::new_with_initial_limit(10), Percentile::default())
+        .with_min_window(Duration::from_millis(100))
+        .with_max_window(Duration::from_secs(5));
+    let limiter = Limiter::builder()
+        .limit_algo(LimitAlgo::WindowedGradient(algo))
         .build();
 
     step_load_sim(seed, limiter)
@@ -142,9 +204,63 @@ fn step_load_sim(seed: u64, limiter: std::sync::Arc<congestion_limiter::limiter:
         }],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
-            failure_rate: FailureRate::Constant(0.01),
+            failure_rate: FailureRate::Constant(0.001),
+            db_timeout: None,
             limiter: None,
         },
+        database: None,
+        seed,
+    }
+}
+
+/// Three AIMD clients behind a Gradient server, which talks to a database modelled as M/M/c.
+///
+/// Load steps up (20 → 80 total rps) then back down, well above the database's natural capacity
+/// (~50 rps with 10 workers at 200ms mean service time). We expect:
+/// - The server's Gradient limit to converge toward the DB worker count as latency rises.
+/// - The three AIMD clients to share the available throughput roughly equally.
+/// - Everything to recover cleanly when load drops back down.
+fn multi_client(seed: u64) -> Simulation {
+    use congestion_limiter::{aggregation::Percentile, limits::{Aimd, Gradient, Windowed}};
+
+    // Erlang(k=2, rate=100): mean service time = k/rate = 20 ms
+    let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
+
+    let clients = (0..3)
+        .map(|id| Client {
+            id,
+            load_pattern: LoadPattern::step(vec![
+                (Duration::from_secs(100), 50.0 / 3.0),
+                (Duration::from_secs(100), 100.0 / 3.0),
+                (Duration::from_secs(100), 150.0 / 3.0),
+                (Duration::from_secs(100), 50.0 / 3.0),
+                (Duration::from_secs(100), 50.0 / 3.0),
+            ]),
+            limiter: Some(
+                Limiter::builder()
+                    .limit_algo(LimitAlgo::Aimd(Aimd::new_with_initial_limit(5)))
+                    .build(),
+            ),
+        })
+        .collect();
+
+    let server_algo = Windowed::new(Gradient::new_with_initial_limit(15), Percentile::default())
+        .with_min_window(Duration::from_millis(100))
+        .with_max_window(Duration::from_secs(5));
+    let server_limiter = Limiter::builder()
+        .limit_algo(LimitAlgo::WindowedGradient(server_algo))
+        .build();
+
+    Simulation {
+        duration: Duration::from_secs(500),
+        clients,
+        server: Server {
+            latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
+            failure_rate: FailureRate::Constant(0.001),
+            db_timeout: Some(Duration::from_secs(1)),
+            limiter: Some(server_limiter),
+        },
+        database: Some(Database::new(2, db_latency)),
         seed,
     }
 }

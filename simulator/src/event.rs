@@ -17,6 +17,8 @@ pub enum Event {
         /// `None` when the server has no limiter.
         server_token: Option<Token>,
         server_outcome: Outcome,
+        /// Whether to decrement the database's in-flight counter on completion.
+        has_db: bool,
     },
 
     /// The simulation has reached its configured end time.
