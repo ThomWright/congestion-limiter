@@ -57,7 +57,7 @@ jobs:
 
       - run: cargo build --verbose
       - run: cargo doc --verbose
-      - run: cargo test --verbose -- --test-threads 1
+      - run: cargo test --verbose
 
   rustfmt:
     name: rustfmt
