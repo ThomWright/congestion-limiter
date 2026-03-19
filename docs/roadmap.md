@@ -42,3 +42,5 @@
   - [x] Rustdoc `#![warn(missing_docs)]`
     - [x] Examples
   - [x] Move most docs into Rust doc format to view in e.g. crates.io
+- [ ] Misc
+  - [ ] Upgrade to Rust 2024 edition

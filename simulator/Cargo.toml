@@ -1,0 +1,15 @@
+[package]
+name = "simulator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "simulator"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+congestion-limiter = { path = ".." }
+rand = { version = "0.8", features = ["small_rng"] }
+statrs = "0.17"
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
