@@ -126,13 +126,12 @@ where
     S: Aggregator,
 {
     fn reset(&mut self, bounds: &RangeInclusive<Duration>) {
+        // Use a window duration of 2 * RTT (RTT ~= min latency observed in the previous window).
+        self.duration = self.min_latency.clamp(*bounds.start(), *bounds.end()) * 2;
+
         self.min_latency = Duration::MAX;
         self.aggregator.reset();
-
         self.start = Instant::now();
-
-        // Use a window duration of 2 * RTT (RTT ~= min latency).
-        self.duration = self.min_latency.clamp(*bounds.start(), *bounds.end()) * 2;
     }
 }
 
@@ -141,6 +140,50 @@ mod tests {
     use crate::{aggregation::Average, limiter::Outcome, limits::Vegas};
 
     use super::*;
+
+    /// Each window's duration should be `2 × min_latency_observed_in_previous_window`.
+    #[tokio::test(start_paused = true)]
+    async fn window_duration_tracks_observed_latency() {
+        let min_latency = Duration::from_millis(100);
+
+        // max_window is much larger than 2 × min_latency. The next window's duration should be
+        // 2 × the minimum latency observed in the previous window, so it should close after
+        // ~200 ms.
+        let windowed = Windowed::new(Vegas::new_with_initial_limit(10), Average::default())
+            .with_min_samples(1)
+            .with_min_window(Duration::ZERO)
+            .with_max_window(Duration::from_secs(3600));
+
+        let sample = Sample {
+            in_flight: 9,
+            latency: min_latency,
+            outcome: Outcome::Success,
+        };
+
+        // Accumulate one sample; the initial window (duration = 1 µs) doesn't close yet.
+        windowed.update(sample).await;
+
+        // Advance past the initial window duration to close it on the next update.
+        tokio::time::advance(Duration::from_micros(2)).await;
+
+        // Close the first window. Vegas records base_latency = min_latency.
+        // The second window starts with duration = 2 × min_latency = 200 ms.
+        windowed.update(sample).await;
+
+        // Advance to just before 2 × min_latency — second window should still be open.
+        tokio::time::advance(min_latency * 2 - Duration::from_millis(1)).await;
+        let limit_before = windowed.update(sample).await;
+        assert_eq!(limit_before, 10, "window should still be open");
+
+        // Advance past 2 × min_latency — second window should now close and update the limit.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let limit_updated = windowed.update(sample).await;
+
+        assert_ne!(
+            limit_before, limit_updated,
+            "limit should update when window closes at 2 * min_latency"
+        );
+    }
 
     #[tokio::test]
     async fn it_works() {

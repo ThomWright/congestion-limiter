@@ -43,8 +43,10 @@ impl ExpSmoothed {
             self.initial_count += 1;
 
             self.value = self.initial_sum / self.initial_count.into();
-        } else {
+        } else if sample >= self.value {
             self.value = self.value + (sample - self.value).mul_f64(self.smoothing_factor);
+        } else {
+            self.value = self.value - (self.value - sample).mul_f64(self.smoothing_factor);
         }
         self.value
     }
