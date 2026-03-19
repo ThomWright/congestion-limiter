@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use conv::ConvAsUtil;
 
 use crate::{
+    limiter::Outcome,
     limits::{defaults, Sample},
     moving_avg,
 };
@@ -45,14 +46,18 @@ struct Inner {
 }
 
 impl Gradient {
-    const DEFAULT_INCREASE: f64 = 4.;
-    const DEFAULT_INCREASE_MIN_UTILISATION: f64 = 0.8;
-    const DEFAULT_INCREASE_MIN_GRADIENT: f64 = 0.9;
-
     const DEFAULT_LONG_WINDOW_SAMPLES: u16 = 500;
 
     const DEFAULT_TOLERANCE: f64 = 2.;
     const DEFAULT_SMOOTHING: f64 = 0.2;
+
+    /// Below this utilisation the limit is left unchanged in either direction.
+    const DEFAULT_MIN_UTILISATION: f64 = 0.5;
+
+    const DEFAULT_INCREASE_MIN_GRADIENT: f64 = 0.9;
+
+    /// Multiplicative decrease applied when a request is dropped (overloaded).
+    const DEFAULT_BACKOFF_RATIO: f64 = 0.9;
 
     #[allow(missing_docs)]
     pub fn new_with_initial_limit(initial_limit: usize) -> Self {
@@ -133,20 +138,31 @@ impl LimitAlgorithm for Gradient {
 
         let utilisation = sample.in_flight as f64 / old_limit;
 
-        // Only apply an increase if we're using enough to justify it
-        // and we're not trying to reduce the limit by much.
-        let increase = if utilisation > Self::DEFAULT_INCREASE_MIN_UTILISATION
-            && gradient > Self::DEFAULT_INCREASE_MIN_GRADIENT
-        {
-            Self::DEFAULT_INCREASE
+        let mut new_limit = if sample.outcome == Outcome::Overload {
+            // On drop: bypass gradient and apply a fixed multiplicative backoff.
+            old_limit * Self::DEFAULT_BACKOFF_RATIO
         } else {
-            0.0
+            // Don't adjust the limit when utilisation is too low — not enough signal.
+            if utilisation < Self::DEFAULT_MIN_UTILISATION {
+                return self.limit.load(Ordering::Acquire);
+            }
+
+            // Additive increase proportional to sqrt(limit), multiplicative decrease via gradient.
+            let queue_size = old_limit.sqrt();
+            let increase = if gradient > Self::DEFAULT_INCREASE_MIN_GRADIENT {
+                queue_size
+            } else {
+                0.0
+            };
+
+            old_limit * gradient + increase
         };
 
-        // Apply gradient, and allow an additive increase.
-        let mut new_limit = old_limit * gradient + increase;
-        new_limit =
-            old_limit * (1.0 - Self::DEFAULT_SMOOTHING) + new_limit * Self::DEFAULT_SMOOTHING;
+        // Apply smoothing only on the way down to avoid slowing recovery.
+        if new_limit < old_limit {
+            new_limit =
+                old_limit * (1.0 - Self::DEFAULT_SMOOTHING) + new_limit * Self::DEFAULT_SMOOTHING;
+        }
 
         new_limit = (new_limit).clamp(self.min_limit as f64, self.max_limit as f64);
 

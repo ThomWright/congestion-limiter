@@ -93,8 +93,11 @@ impl Vegas {
     /// Used when we see overload occurring.
     const DEFAULT_DECREASE_FACTOR: f64 = 0.9;
 
-    /// Utilisation needs to be above this to increase the limit.
-    const DEFAULT_INCREASE_MIN_UTILISATION: f64 = 0.8;
+    /// Below this utilisation the limit is left unchanged in either direction.
+    ///
+    /// At low utilisation there is no useful signal: queueing estimates are noisy and there is no
+    /// reason to adjust the limit. Only overload (explicit failure) still triggers a decrease.
+    const DEFAULT_MIN_UTILISATION: f64 = 0.5;
 
     /// Default probe multiplier. A probe fires every `~probe_multiplier * limit` samples.
     const DEFAULT_PROBE_MULTIPLIER: usize = 30;
@@ -239,15 +242,14 @@ impl LimitAlgorithm for Vegas {
             let limit = if sample.outcome == Outcome::Overload {
                 // Limit too big – overload
                 multiplicative_decrease(limit, Self::DEFAULT_DECREASE_FACTOR)
+            } else if utilisation < Self::DEFAULT_MIN_UTILISATION {
+                // Low utilisation – signal is too noisy to act on; leave the limit alone
+                limit
             } else if estimated_queued_jobs > (self.beta)(limit) {
                 // Limit too big – too much queueing
                 limit - increment
-            } else if estimated_queued_jobs < (self.alpha)(limit)
-                && utilisation >= Self::DEFAULT_INCREASE_MIN_UTILISATION
-            {
-                // Limit too small – low queueing + high utilisation
-
-                // TODO: support some kind of fast start, e.g. increase by beta when almost no queueing
+            } else if estimated_queued_jobs < (self.alpha)(limit) {
+                // Limit too small – low queueing
                 limit + increment
             } else {
                 // Perfect porridge

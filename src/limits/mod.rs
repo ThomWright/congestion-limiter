@@ -29,7 +29,7 @@ pub trait LimitAlgorithm: Debug + Sync {
 }
 
 /// The result of a job (or jobs), including the [Outcome] (loss) and latency (delay).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
     pub(crate) latency: Duration,
     /// Jobs in flight when the sample was taken.
