@@ -62,15 +62,15 @@ unset boxwidth
 
 plot for [node in system("awk 'NR>1{print $2}' ".datadir."/snapshots.dat | sort -u")] \
     sprintf("< awk '$2==\"%s\"{print $1,$3}' %s/snapshots.dat", node, datadir) \
-    using 1:2 with lines lw 2 title node noenhanced
+    using 1:2 with steps lw 2 title node noenhanced
 
 # --- Panel 4: In-flight over time ---
-set title "In-flight requests"
+set title "In-flight requests (1s bins)"
 set xlabel "Time (s)"
 set ylabel "In-flight"
 
 plot for [node in system("awk 'NR>1{print $2}' ".datadir."/snapshots.dat | sort -u")] \
-    sprintf("< awk '$2==\"%s\"{print $1,$4}' %s/snapshots.dat", node, datadir) \
+    sprintf("< awk -v bw=1.0 '$2==\"%s\"{b=int($1/bw); s[b]+=$4; c[b]++} END{for(b in c) print (b+0.5)*bw, s[b]/c[b]}' %s/snapshots.dat | sort -n", node, datadir) \
     using 1:2 with lines lw 2 title node noenhanced
 
 # --- Panel 5: Latency heatmap ---

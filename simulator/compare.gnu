@@ -41,21 +41,21 @@ plot for [i=1:words(algos)] zerofill("client_rejected", basedir."/".word(algos, 
 
 # --- Panel 3: Concurrency limit ---
 # For multi-client scenarios (e.g. fairness) client_0 is one representative partition.
-set title "Concurrency limit (client_0)"
+set title "Concurrency limit (client_0, 1s bins)"
 set xlabel "Time (s)"
 set ylabel "Limit"
 plot for [i=1:words(algos)] \
-    sprintf("< awk 'NR>1 && $2==\"client_0\"{print $1,$3}' %s/%s/snapshots.dat", \
-        basedir, word(algos, i)) \
+    sprintf("< awk -v bw=%g 'NR>1 && $2==\"client_0\"{b=int($1/bw); s[b]+=$3; c[b]++} END{for(b in c) print (b+0.5)*bw, s[b]/c[b]}' %s/%s/snapshots.dat | sort -n", \
+        binwidth, basedir, word(algos, i)) \
     using 1:2 with lines lw 2 lc rgb color(i) title word(algos, i) noenhanced
 
 # --- Panel 4: In-flight requests ---
-set title "In-flight requests (client_0)"
+set title "In-flight requests (client_0, 1s bins)"
 set xlabel "Time (s)"
 set ylabel "In-flight"
 plot for [i=1:words(algos)] \
-    sprintf("< awk 'NR>1 && $2==\"client_0\"{print $1,$4}' %s/%s/snapshots.dat", \
-        basedir, word(algos, i)) \
+    sprintf("< awk -v bw=%g 'NR>1 && $2==\"client_0\"{b=int($1/bw); s[b]+=$4; c[b]++} END{for(b in c) print (b+0.5)*bw, s[b]/c[b]}' %s/%s/snapshots.dat | sort -n", \
+        binwidth, basedir, word(algos, i)) \
     using 1:2 with lines lw 2 lc rgb color(i) title word(algos, i) noenhanced
 
 # --- Panel 5: Mean latency of completed requests ---
