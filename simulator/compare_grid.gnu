@@ -23,7 +23,7 @@ req_xmax = STATS_max + binwidth
 tbin_w = 1.0
 lbin_w = 10.0
 
-set multiplot layout 6,3 margins 0.06,0.98,0.01,0.97 spacing 0.06,0.06
+set multiplot layout 6,3 margins 0.06,0.98,0.04,0.97 spacing 0.06,0.06
 
 do for [i=1:words(algos)] {
     algo = word(algos, i)
