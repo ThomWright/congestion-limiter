@@ -13,7 +13,6 @@ pub enum LimitAlgo {
     WindowedVegas(Windowed<Vegas, Percentile>),
     Gradient(Gradient),
     WindowedGradient(Windowed<Gradient, Percentile>),
-    #[allow(dead_code, reason = "available for baseline scenarios, not yet used")]
     Fixed(Fixed),
 }
 
