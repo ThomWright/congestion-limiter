@@ -110,39 +110,40 @@ impl LimitAlgorithm for Gradient {
     }
 
     async fn update(&self, sample: Sample) -> usize {
-        if sample.latency < MIN_SAMPLE_LATENCY {
-            return self.limit.load(Ordering::Acquire);
-        }
-
         let mut inner = match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Update long window
-        let long = inner.long_window_latency.sample(sample.latency);
-
-        let ratio = long.as_secs_f64() / sample.latency.as_secs_f64();
-
-        // Speed up return to baseline after long period of increased load.
-        if ratio > 2.0 {
-            inner.long_window_latency.set(long.mul_f64(0.95));
-        }
-
         let old_limit = inner.limit;
 
-        // Only apply downwards gradient (when latency has increased).
-        // Limit to >= 0.5 to prevent aggressive load shedding.
-        // Tolerate a given amount of latency difference.
-        let gradient = (Self::DEFAULT_TOLERANCE * ratio).clamp(0.5, 1.0);
-
-        let utilisation = sample.in_flight as f64 / old_limit;
-
         let mut new_limit = if sample.outcome == Outcome::Overload {
-            // On drop: bypass gradient and apply a fixed multiplicative backoff.
+            // Apply a fixed multiplicative backoff on overload regardless of latency.
+            // This ensures server-side rejections, which have near-zero observed latency,
+            // are still treated as a congestion signal.
             old_limit * Self::DEFAULT_BACKOFF_RATIO
         } else {
+            // Without a valid latency measurement there is no gradient to compute.
+            if sample.latency < MIN_SAMPLE_LATENCY {
+                return self.limit.load(Ordering::Acquire);
+            }
+
+            // Update long window
+            let long = inner.long_window_latency.sample(sample.latency);
+            let ratio = long.as_secs_f64() / sample.latency.as_secs_f64();
+
+            // Speed up return to baseline after long period of increased load.
+            if ratio > 2.0 {
+                inner.long_window_latency.set(long.mul_f64(0.95));
+            }
+
+            // Only apply downwards gradient (when latency has increased).
+            // Limit to >= 0.5 to prevent aggressive load shedding.
+            // Tolerate a given amount of latency difference.
+            let gradient = (Self::DEFAULT_TOLERANCE * ratio).clamp(0.5, 1.0);
+
             // Don't adjust the limit when utilisation is too low — not enough signal.
+            let utilisation = sample.in_flight as f64 / old_limit;
             if utilisation < Self::DEFAULT_MIN_UTILISATION {
                 return self.limit.load(Ordering::Acquire);
             }
@@ -184,6 +185,24 @@ mod tests {
     use crate::limiter::{Limiter, Outcome};
 
     use super::*;
+
+    #[tokio::test]
+    async fn decreases_on_zero_latency_overload() {
+        let limiter = Limiter::builder()
+            .limit_algo(Gradient::new_with_initial_limit(20))
+            .build();
+
+        let initial = limiter.state().limit();
+        for _ in 0..10 {
+            let mut token = limiter.try_acquire().unwrap();
+            token.set_latency(Duration::ZERO);
+            token.set_outcome(Outcome::Overload).await;
+        }
+        assert!(
+            limiter.state().limit() < initial,
+            "zero-latency overload (server rejection) must decrease the limit"
+        );
+    }
 
     #[tokio::test]
     async fn it_works() {
