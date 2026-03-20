@@ -22,20 +22,26 @@ use super::{aimd::multiplicative_decrease, defaults::MIN_SAMPLE_LATENCY, LimitAl
 /// Estimates queuing delay by comparing the current latency with the minimum observed latency to
 /// estimate the number of jobs being queued.
 ///
-/// # Baseline latency requirement
+/// # When to use Vegas
 ///
 /// Vegas uses the minimum observed latency as a proxy for "no-load" latency. This works well when
 /// the no-load latency is stable — as in TCP, where the base RTT is essentially deterministic
-/// (propagation delay over a fixed path). It works poorly when service latency has high intrinsic
-/// variance: even under light load, the minimum observed sample is just the lucky tail of a wide
-/// distribution, not a meaningful floor. Normal completions then look like they carry queueing
-/// delay, causing spurious limit decreases.
+/// (propagation delay over a fixed path).
 ///
-/// **For services with high latency variance, always wrap with a percentile window sampler.**
-/// This aggregates individual samples into a stable percentile (e.g. P90) over a time window.
-/// Vegas then compares recent P90 with the minimum *observed P90*, which is far more stable than
-/// the minimum individual sample. As long as the windowed percentile is reasonably stable, Vegas
-/// can distinguish genuine congestion from natural variance.
+/// Vegas is generally only suitable for services with a tight, stable latency distribution: a
+/// single type of operation with low variance, such as cache reads or simple key-value lookups. In
+/// these cases, the minimum observed latency is a reasonable proxy for the true no-load cost.
+///
+/// It works poorly for services with wide latency distributions — for example, those handling mixed
+/// operation types or where individual operation cost varies significantly. With a wide
+/// distribution, the minimum observed latency is just the lucky tail, not a meaningful floor.
+/// Normal completions then look like they carry queuing delay, causing spurious limit decreases.
+/// Over time, the baseline drifts far below the true no-load latency, and the concurrency limit
+/// converges well below the server's actual capacity.
+///
+/// For typical backend services with variable latency, prefer [`Gradient`](super::Gradient), which
+/// compares recent latency against a longer-term moving average and does not rely on a minimum
+/// baseline.
 ///
 /// Can fairly distribute concurrency between independent clients as long as there is enough server
 /// capacity to handle the requests. That is: as long as the server isn't overloaded and failing to
@@ -210,9 +216,8 @@ impl LimitAlgorithm for Vegas {
 
         let current_limit = self.limit.load(Ordering::Acquire);
         inner.samples_since_probe += 1;
-        let probe_interval = (inner.probe_jitter
-            * self.probe_multiplier as f64
-            * current_limit as f64) as usize;
+        let probe_interval =
+            (inner.probe_jitter * self.probe_multiplier as f64 * current_limit as f64) as usize;
         if inner.samples_since_probe >= probe_interval {
             // Probe: reset the baseline to the current sample and leave the limit unchanged.
             // This prevents the all-time minimum from drifting arbitrarily low over long runs.
