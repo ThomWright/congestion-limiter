@@ -44,13 +44,13 @@ do for [i=1:words(algos)] {
 
     plot adir."/requests.dat" \
         using (binwidth*floor($1/binwidth)+binwidth/2):(1.0/binwidth) \
-        smooth freq with boxes lc rgb "#e84c4c" title "c-rej", \
+        smooth freq with boxes lc rgb "#e8a84c" title "c-rej", \
         adir."/requests.dat" \
         using (binwidth*floor($1/binwidth)+binwidth/2):(strcol(4) ne "client_rejected" ? 1.0/binwidth : 0.0) \
         smooth freq with boxes lc rgb "#9b4ce8" title "s-rej", \
         adir."/requests.dat" \
         using (binwidth*floor($1/binwidth)+binwidth/2):((strcol(4) eq "success"||strcol(4) eq "overload") ? 1.0/binwidth : 0.0) \
-        smooth freq with boxes lc rgb "#e8a84c" title "ovld", \
+        smooth freq with boxes lc rgb "#e84c4c" title "ovld", \
         adir."/requests.dat" \
         using (binwidth*floor($1/binwidth)+binwidth/2):(strcol(4) eq "success" ? 1.0/binwidth : 0.0) \
         smooth freq with boxes lc rgb "#4c9be8" title "ok"

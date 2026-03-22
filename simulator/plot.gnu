@@ -32,13 +32,13 @@ set style fill solid 0.6
 # Exposed red = client rejected; exposed purple = server rejected; exposed orange = overload; blue = success.
 plot datadir."/requests.dat" \
     using (bin($1)):(1.0/binwidth) \
-    smooth freq with boxes lc rgb "#e84c4c" title "client rejected", \
+    smooth freq with boxes lc rgb "#e8a84c" title "client rejected", \
     datadir."/requests.dat" \
     using (bin($1)):(strcol(4) ne "client_rejected" ? 1.0/binwidth : 0.0) \
     smooth freq with boxes lc rgb "#9b4ce8" title "server rejected", \
     datadir."/requests.dat" \
     using (bin($1)):((strcol(4) eq "success" || strcol(4) eq "overload") ? 1.0/binwidth : 0.0) \
-    smooth freq with boxes lc rgb "#e8a84c" title "overload", \
+    smooth freq with boxes lc rgb "#e84c4c" title "overload", \
     datadir."/requests.dat" \
     using (bin($1)):(strcol(4) eq "success" ? 1.0/binwidth : 0.0) \
     smooth freq with boxes lc rgb "#4c9be8" title "success"
