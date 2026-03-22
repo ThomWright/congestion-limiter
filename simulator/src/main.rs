@@ -49,12 +49,6 @@ fn main() {
 
     let sim = match (scenario, algo) {
         ("basic", _) => scenarios::basic(seed),
-        ("step_load_aimd", _) => scenarios::step_load_aimd(seed),
-        ("step_load_windowed_aimd", _) => scenarios::step_load_windowed_aimd(seed),
-        ("step_load_vegas", _) => scenarios::step_load_vegas(seed),
-        ("step_load_windowed_vegas", _) => scenarios::step_load_windowed_vegas(seed),
-        ("step_load_gradient", _) => scenarios::step_load_gradient(seed),
-        ("step_load_windowed_gradient", _) => scenarios::step_load_windowed_gradient(seed),
         ("multi_client", _) => scenarios::multi_client(seed),
         ("convergence_start_high", Some(a)) => scenarios::convergence_start_high(seed, a),
         ("convergence_start_low", Some(a)) => scenarios::convergence_start_low(seed, a),
@@ -69,8 +63,8 @@ fn main() {
         }
         (other, _) => {
             eprintln!("Unknown scenario: {other}");
-            eprintln!("Available scenarios: basic, step_load_aimd, step_load_windowed_aimd, step_load_vegas, step_load_windowed_vegas, step_load_gradient, step_load_windowed_gradient, multi_client");
-            eprintln!("Scenarios requiring --algo: overload_high, overload_low, ramp, spike, high_variance, fairness");
+            eprintln!("Available scenarios: basic, multi_client");
+            eprintln!("Scenarios requiring --algo: convergence_start_high, convergence_start_low, ramp, spike, high_variance, fairness");
             std::process::exit(1);
         }
     };
