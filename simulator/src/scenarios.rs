@@ -74,33 +74,16 @@ pub fn basic(seed: u64) -> Simulation {
     }
 }
 
-/// Three AIMD clients behind a Gradient server, which talks to a database modelled as M/M/c.
+/// AIMD client behind a WindoedGradient server, which talks to a database modelled as M/M/c.
 ///
-/// Load steps up (20 → 80 total rps) then back down, well above the database's natural capacity
-/// (~50 rps with 10 workers at 200ms mean service time). We expect:
-/// - The server's Gradient limit to converge toward the DB worker count as latency rises.
-/// - The three AIMD clients to share the available throughput roughly equally.
+/// Tests layered limiting: the client and server each run independent algorithms. Load steps
+/// up (50 → 100 → 150 rps) then back down, above the database's natural capacity (~100 rps
+/// with 2 workers at 20ms mean service time). We expect:
+/// - The server's limit to converge toward the DB worker count as latency rises.
+/// - The client's limit to track the server's available capacity.
 /// - Everything to recover cleanly when load drops back down.
-pub fn multi_client(seed: u64) -> Simulation {
+pub fn client_server(seed: u64) -> Simulation {
     let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
-
-    let clients = (0..3)
-        .map(|id| Client {
-            id,
-            load_pattern: LoadPattern::step(vec![
-                (Duration::from_secs(100), 50.0 / 3.0),
-                (Duration::from_secs(100), 100.0 / 3.0),
-                (Duration::from_secs(100), 150.0 / 3.0),
-                (Duration::from_secs(100), 50.0 / 3.0),
-                (Duration::from_secs(100), 50.0 / 3.0),
-            ]),
-            limiter: Some(
-                Limiter::builder()
-                    .limit_algo(LimitAlgo::Aimd(Aimd::new_with_initial_limit(5)))
-                    .build(),
-            ),
-        })
-        .collect();
 
     let server_algo = Windowed::new(Gradient::new_with_initial_limit(15), Percentile::default())
         .with_min_window(Duration::from_millis(1))
@@ -111,7 +94,21 @@ pub fn multi_client(seed: u64) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(500),
-        clients,
+        clients: vec![Client {
+            id: 0,
+            load_pattern: LoadPattern::step(vec![
+                (Duration::from_secs(100), 50.0),
+                (Duration::from_secs(100), 100.0),
+                (Duration::from_secs(100), 150.0),
+                (Duration::from_secs(100), 50.0),
+                (Duration::from_secs(100), 50.0),
+            ]),
+            limiter: Some(
+                Limiter::builder()
+                    .limit_algo(LimitAlgo::Aimd(Aimd::new_with_initial_limit(5)))
+                    .build(),
+            ),
+        }],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),

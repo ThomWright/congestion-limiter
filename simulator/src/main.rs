@@ -49,7 +49,7 @@ fn main() {
 
     let sim = match (scenario, algo) {
         ("basic", _) => scenarios::basic(seed),
-        ("multi_client", _) => scenarios::multi_client(seed),
+        ("client_server", _) => scenarios::client_server(seed),
         ("convergence_start_high", Some(a)) => scenarios::convergence_start_high(seed, a),
         ("convergence_start_low", Some(a)) => scenarios::convergence_start_low(seed, a),
         ("ramp", Some(a)) => scenarios::ramp(seed, a),
@@ -63,7 +63,7 @@ fn main() {
         }
         (other, _) => {
             eprintln!("Unknown scenario: {other}");
-            eprintln!("Available scenarios: basic, multi_client");
+            eprintln!("Available scenarios: basic, client_server");
             eprintln!("Scenarios requiring --algo: convergence_start_high, convergence_start_low, ramp, spike, high_variance, fairness");
             std::process::exit(1);
         }
