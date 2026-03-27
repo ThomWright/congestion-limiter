@@ -74,40 +74,30 @@ pub fn basic(seed: u64) -> Simulation {
     }
 }
 
-/// AIMD client behind a WindoedGradient server, which talks to a database modelled as M/M/c.
+/// Two-tier scenario: a client calls a server which talks to a database modelled as M/M/c.
 ///
 /// Tests layered limiting: the client and server each run independent algorithms. Load steps
 /// up (50 → 100 → 150 rps) then back down, above the database's natural capacity (~100 rps
-/// with 2 workers at 20ms mean service time). We expect:
-/// - The server's limit to converge toward the DB worker count as latency rises.
-/// - The client's limit to track the server's available capacity.
-/// - Everything to recover cleanly when load drops back down.
-pub fn client_server(seed: u64) -> Simulation {
+/// with 2 workers at 20ms mean service time).
+pub fn client_server(seed: u64, client_algo: &str, server_algo: &str) -> Simulation {
     let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
 
-    let server_algo = Windowed::new(Gradient::new_with_initial_limit(15), Percentile::default())
-        .with_min_window(Duration::from_millis(1))
-        .with_max_window(Duration::from_secs(1));
-    let server_limiter = Limiter::builder()
-        .limit_algo(LimitAlgo::WindowedGradient(server_algo))
-        .build();
+    let server_limiter = build_limiter(server_algo, 15);
 
     Simulation {
-        duration: Duration::from_secs(500),
+        duration: Duration::from_secs(450),
         clients: vec![Client {
             id: 0,
-            load_pattern: LoadPattern::step(vec![
-                (Duration::from_secs(100), 50.0),
-                (Duration::from_secs(100), 100.0),
-                (Duration::from_secs(100), 150.0),
-                (Duration::from_secs(100), 50.0),
-                (Duration::from_secs(100), 50.0),
+            load_pattern: LoadPattern::segments(vec![
+                (Duration::from_secs(120), 200.0),  // ramp up   1→200
+                (Duration::from_secs(120), 1.0),    // ramp down 200→1
+                (Duration::from_secs(30), 30.0),    // ease to 30 (calm before spike)
+                (Duration::ZERO, 300.0),             // spike to 300
+                (Duration::from_secs(90), 300.0),   // hold spike for 90s
+                (Duration::ZERO, 30.0),              // drop back to 30
+                (Duration::from_secs(90), 30.0),    // recover at 30 for 90s
             ]),
-            limiter: Some(
-                Limiter::builder()
-                    .limit_algo(LimitAlgo::Aimd(Aimd::new_with_initial_limit(5)))
-                    .build(),
-            ),
+            limiter: Some(build_limiter(client_algo, 5)),
         }],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
