@@ -209,6 +209,6 @@ fn snapshot_all(now: Instant, sim: &Simulation, metrics: &mut Metrics) {
         metrics.snapshot_limiter(now, "server", state);
     }
     if let Some(db) = &sim.database {
-        metrics.snapshot_gauge(now, "database", db.in_flight(), db.workers);
+        metrics.snapshot_gauge(now, "database", db.in_flight(), db.workers());
     }
 }
