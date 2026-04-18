@@ -186,6 +186,39 @@ pub fn load(seed: u64, algo: &str) -> Simulation {
     }
 }
 
+/// Tests algorithm tracking under both gradual and sudden DB capacity changes.
+///
+/// Constant load at ~150 rps. DB workers reduce gradually from 4→1 over 120s
+/// (simulating slow degradation), recover to 4, then drop suddenly to 1 and recover.
+/// Each worker handles ~50 rps (Erlang(2, 100), mean 20ms service time).
+pub fn capacity(seed: u64, algo: &str) -> Simulation {
+    let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
+
+    let db = Database::new(4, db_latency).with_capacity_timeline(vec![
+        (Duration::from_secs(40),  3), // gradual reduction: 4→3
+        (Duration::from_secs(80),  2), //                    3→2
+        (Duration::from_secs(120), 1), //                    2→1 (fully degraded)
+        (Duration::from_secs(180), 2), // gradual recovery:  1→2
+        (Duration::from_secs(210), 3), //                    2→3
+        (Duration::from_secs(240), 4), //                    3→4 (recovered)
+        (Duration::from_secs(360), 1), // sudden drop to 1
+        (Duration::from_secs(450), 4), // sudden recovery to 4
+    ]);
+
+    Simulation {
+        duration: Duration::from_secs(510),
+        clients: vec![Client::new(0, LoadPattern::constant(150.0), Some(build_limiter(algo, 10)))],
+        server: Server {
+            latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
+            failure_rate: FailureRate::Constant(0.001),
+            db_timeout: Some(Duration::from_secs(1)),
+            limiter: None,
+        },
+        database: Some(db),
+        seed,
+    }
+}
+
 /// Same load profile as `step_load_sim` but with exponential latency (high variance).
 ///
 /// Uses Erlang(k=1, rate=10) — same mean (100ms) as the standard scenarios but much higher
