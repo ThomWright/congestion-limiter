@@ -247,21 +247,43 @@ pub fn high_variance(seed: u64, algo: &str) -> Simulation {
     }
 }
 
-/// Tests whether N clients converge to equal shares of a fixed server capacity (~150 rps).
+/// Tests equal-share convergence as clients join and leave over time.
 ///
-/// 3 clients, each sending 100 rps (300 rps total). Server has Fixed(30) limit.
-/// Each client starts with limit=20 (above fair share of 10).
+/// 9 clients total (3 always active, 3 gradual joiners, 3 batch joiners), each
+/// generating 60 rps when active. Fixed server capacity (Fixed(30) limiter,
+/// ~150 rps at 200ms mean latency). Fair share with 6 active = 5 slots ≈ 25 rps.
+///
+/// Phase 1 (gradual): clients 3–5 join one at a time at t=60/80/100s,
+///   then leave one at a time at t=180/200/220s.
+/// Phase 2 (batch): clients 6–8 all join at t=300s, all leave at t=360s.
+///
+/// Note: `client.id` must equal its index in the `clients` Vec — the engine uses
+/// `client_id` as a direct index.
 pub fn fairness(seed: u64, algo: &str) -> Simulation {
     let server_limiter = Limiter::builder()
         .limit_algo(LimitAlgo::Fixed(Fixed::new(30)))
         .build();
 
-    let clients = (0..3)
-        .map(|id| Client::new(id, LoadPattern::constant(100.0), Some(build_limiter(algo, 20))))
-        .collect();
+    let limiter = || Some(build_limiter(algo, 20));
+    let constant = || LoadPattern::constant(60.0);
+
+    let clients = vec![
+        // Always active.
+        Client::new(0, constant(), limiter()),
+        Client::new(1, constant(), limiter()),
+        Client::new(2, constant(), limiter()),
+        // Gradual joiners.
+        Client::new(3, constant(), limiter()).active_from(Duration::from_secs(60)).active_until(Duration::from_secs(180)),
+        Client::new(4, constant(), limiter()).active_from(Duration::from_secs(80)).active_until(Duration::from_secs(200)),
+        Client::new(5, constant(), limiter()).active_from(Duration::from_secs(100)).active_until(Duration::from_secs(220)),
+        // Batch joiners.
+        Client::new(6, constant(), limiter()).active_from(Duration::from_secs(300)).active_until(Duration::from_secs(360)),
+        Client::new(7, constant(), limiter()).active_from(Duration::from_secs(300)).active_until(Duration::from_secs(360)),
+        Client::new(8, constant(), limiter()).active_from(Duration::from_secs(300)).active_until(Duration::from_secs(360)),
+    ];
 
     Simulation {
-        duration: Duration::from_secs(180),
+        duration: Duration::from_secs(450),
         clients,
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
