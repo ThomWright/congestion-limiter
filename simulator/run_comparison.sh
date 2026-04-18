@@ -7,13 +7,13 @@
 #
 # Examples:
 #   ./simulator/run_comparison.sh
-#   ./simulator/run_comparison.sh ramp spike
+#   ./simulator/run_comparison.sh load capacity
 #   ./simulator/run_comparison.sh --seed 42 convergence_start_high
 #   ./simulator/run_comparison.sh client_server
 
 set -euo pipefail
 
-ALL_SCENARIOS="convergence_start_high convergence_start_low ramp spike high_variance fairness client_server"
+ALL_SCENARIOS="convergence_start_high convergence_start_low load capacity high_variance fairness client_server"
 ALGOS="aimd windowed_aimd vegas windowed_vegas gradient windowed_gradient"
 CLIENT_SERVER_COMBOS="windowed_aimd windowed_gradient"
 
