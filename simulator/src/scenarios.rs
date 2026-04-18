@@ -18,7 +18,7 @@ use crate::{
 
 /// Build a limiter using the named algorithm with the given initial limit.
 ///
-/// Windowed variants use `min_window=100ms`, `max_window=5s`, and `Percentile` aggregation.
+/// Windowed variants use `min_window=1ms`, `max_window=1s`, and `Percentile` aggregation.
 /// Exits the process with an error message if the name is not recognised.
 pub fn build_limiter(algo: &str, initial_limit: usize) -> Arc<Limiter<LimitAlgo>> {
     let limit_algo = match algo {
@@ -57,11 +57,7 @@ pub fn basic(seed: u64) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(30),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::constant(100.0),
-            limiter: Some(limiter),
-        }],
+        clients: vec![Client::new(0, LoadPattern::constant(100.0), Some(limiter))],
         server: Server {
             // Mean latency ~200 ms (Erlang k=2, rate=10 → mean = k/rate = 0.2 s)
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
@@ -76,9 +72,8 @@ pub fn basic(seed: u64) -> Simulation {
 
 /// Two-tier scenario: a client calls a server which talks to a database modelled as M/M/c.
 ///
-/// Tests layered limiting: the client and server each run independent algorithms. Load steps
-/// up (50 → 100 → 150 rps) then back down, above the database's natural capacity (~100 rps
-/// with 2 workers at 20ms mean service time).
+/// Tests layered limiting: the client and server each run independent algorithms. Load
+/// ramps up to 2× DB capacity and back, then spikes to 3× capacity and recovers.
 pub fn client_server(seed: u64, client_algo: &str, server_algo: &str) -> Simulation {
     let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
 
@@ -86,9 +81,9 @@ pub fn client_server(seed: u64, client_algo: &str, server_algo: &str) -> Simulat
 
     Simulation {
         duration: Duration::from_secs(450),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::segments(vec![
+        clients: vec![Client::new(
+            0,
+            LoadPattern::segments(vec![
                 (Duration::from_secs(120), 200.0),  // ramp up   1→200
                 (Duration::from_secs(120), 1.0),    // ramp down 200→1
                 (Duration::from_secs(30), 30.0),    // ease to 30 (calm before spike)
@@ -97,8 +92,8 @@ pub fn client_server(seed: u64, client_algo: &str, server_algo: &str) -> Simulat
                 (Duration::ZERO, 30.0),              // drop back to 30
                 (Duration::from_secs(90), 30.0),    // recover at 30 for 90s
             ]),
-            limiter: Some(build_limiter(client_algo, 5)),
-        }],
+            Some(build_limiter(client_algo, 5)),
+        )],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -121,11 +116,7 @@ pub fn convergence_start_high(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(120),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::constant(200.0),
-            limiter: Some(build_limiter(algo, 100)),
-        }],
+        clients: vec![Client::new(0, LoadPattern::constant(200.0), Some(build_limiter(algo, 100)))],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -148,11 +139,7 @@ pub fn convergence_start_low(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(120),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::constant(200.0),
-            limiter: Some(build_limiter(algo, 2)),
-        }],
+        clients: vec![Client::new(0, LoadPattern::constant(200.0), Some(build_limiter(algo, 2)))],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -174,16 +161,16 @@ pub fn ramp(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(360),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::segments(vec![
+        clients: vec![Client::new(
+            0,
+            LoadPattern::segments(vec![
                 (Duration::from_secs(90), 200.0),  // ramp up   1→200
                 (Duration::from_secs(90), 1.0),    // ramp down 200→1
                 (Duration::from_secs(90), 200.0),  // ramp up   1→200
                 (Duration::from_secs(90), 1.0),    // ramp down 200→1
             ]),
-            limiter: Some(build_limiter(algo, 10)),
-        }],
+            Some(build_limiter(algo, 10)),
+        )],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -204,17 +191,17 @@ pub fn spike(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(390),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::step(vec![
+        clients: vec![Client::new(
+            0,
+            LoadPattern::step(vec![
                 (Duration::from_secs(30), 30.0),
                 (Duration::from_secs(90), 300.0),
                 (Duration::from_secs(90), 30.0),
                 (Duration::from_secs(90), 300.0),
                 (Duration::from_secs(90), 30.0),
             ]),
-            limiter: Some(build_limiter(algo, 10)),
-        }],
+            Some(build_limiter(algo, 10)),
+        )],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -228,20 +215,20 @@ pub fn spike(seed: u64, algo: &str) -> Simulation {
 
 /// Same load profile as `step_load_sim` but with exponential latency (high variance).
 ///
-/// Uses Erlang(k=1, rate=5) — same mean (200ms) as the standard scenarios but much higher
+/// Uses Erlang(k=1, rate=10) — same mean (100ms) as the standard scenarios but much higher
 /// variance. Shows how latency noise affects each algorithm's stability.
 pub fn high_variance(seed: u64, algo: &str) -> Simulation {
     Simulation {
         duration: Duration::from_secs(60),
-        clients: vec![Client {
-            id: 0,
-            load_pattern: LoadPattern::step(vec![
+        clients: vec![Client::new(
+            0,
+            LoadPattern::step(vec![
                 (Duration::from_secs(20), 20.0),
                 (Duration::from_secs(20), 100.0),
                 (Duration::from_secs(20), 20.0),
             ]),
-            limiter: Some(build_limiter(algo, 10)),
-        }],
+            Some(build_limiter(algo, 10)),
+        )],
         server: Server {
             // Erlang(k=1, rate=10) = Exponential(rate=10): mean=100ms, high variance
             latency: Erlang::new(1, 10.0).expect("valid Erlang params"),
@@ -264,11 +251,7 @@ pub fn fairness(seed: u64, algo: &str) -> Simulation {
         .build();
 
     let clients = (0..3)
-        .map(|id| Client {
-            id,
-            load_pattern: LoadPattern::constant(100.0),
-            limiter: Some(build_limiter(algo, 20)),
-        })
+        .map(|id| Client::new(id, LoadPattern::constant(100.0), Some(build_limiter(algo, 20))))
         .collect();
 
     Simulation {

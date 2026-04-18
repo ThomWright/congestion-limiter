@@ -23,13 +23,15 @@ pub async fn run(sim: &Simulation) -> Metrics {
 
     // Schedule the first arrival for each client and the simulation end.
     for client in &sim.clients {
-        let dt = client.next_arrival_offset(Duration::ZERO, &mut rng);
-        queue.push(Reverse(ScheduledEvent {
-            time: start + dt,
-            event: Event::Arrive {
-                client_id: client.id,
-            },
-        }));
+        if client.active_from < sim.duration {
+            let dt = client.next_arrival_offset(Duration::ZERO, &mut rng);
+            queue.push(Reverse(ScheduledEvent {
+                time: start + client.active_from + dt,
+                event: Event::Arrive {
+                    client_id: client.id,
+                },
+            }));
+        }
     }
     queue.push(Reverse(ScheduledEvent {
         time: start + sim.duration,
@@ -66,7 +68,7 @@ pub async fn run(sim: &Simulation) -> Metrics {
                                 client_id,
                                 RequestOutcome::ClientRejected,
                             );
-                            snapshot_all(now, sim, &mut metrics);
+                            snapshot_all(now, elapsed, sim, &mut metrics);
                             schedule_next(
                                 &mut queue,
                                 client,
@@ -144,7 +146,7 @@ pub async fn run(sim: &Simulation) -> Metrics {
                     }));
                 }
 
-                snapshot_all(now, sim, &mut metrics);
+                snapshot_all(now, elapsed, sim, &mut metrics);
                 schedule_next(
                     &mut queue,
                     client,
@@ -178,8 +180,9 @@ pub async fn run(sim: &Simulation) -> Metrics {
                     Outcome::Overload => RequestOutcome::Overload,
                     Outcome::Success => RequestOutcome::Success,
                 };
+                let elapsed = now.duration_since(start);
                 metrics.record_request(now, client_id, start_time, outcome);
-                snapshot_all(now, sim, &mut metrics);
+                snapshot_all(now, elapsed, sim, &mut metrics);
             }
 
             Event::CapacityChange { workers } => {
@@ -204,7 +207,8 @@ fn schedule_next(
     duration: Duration,
     rng: &mut SmallRng,
 ) {
-    if now < start + duration {
+    let active_until = client.active_until.unwrap_or(duration);
+    if now < start + duration && elapsed < active_until {
         let dt = client.next_arrival_offset(elapsed, rng);
         queue.push(Reverse(ScheduledEvent {
             time: now + dt,
@@ -215,10 +219,12 @@ fn schedule_next(
     }
 }
 
-fn snapshot_all(now: Instant, sim: &Simulation, metrics: &mut Metrics) {
+fn snapshot_all(now: Instant, elapsed: Duration, sim: &Simulation, metrics: &mut Metrics) {
     for client in &sim.clients {
-        if let Some(state) = client.limiter_state() {
-            metrics.snapshot_limiter(now, &format!("client_{}", client.id), state);
+        if elapsed >= client.active_from {
+            if let Some(state) = client.limiter_state() {
+                metrics.snapshot_limiter(now, &format!("client_{}", client.id), state);
+            }
         }
     }
     if let Some(state) = sim.server.limiter_state() {

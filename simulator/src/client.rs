@@ -11,9 +11,36 @@ pub struct Client {
     pub id: usize,
     pub load_pattern: LoadPattern,
     pub limiter: Option<Arc<Limiter<LimitAlgo>>>,
+    /// When this client starts generating requests, measured from simulation start.
+    pub active_from: Duration,
+    /// When this client stops generating requests, measured from simulation start.
+    /// `None` means active until the simulation ends.
+    pub active_until: Option<Duration>,
 }
 
 impl Client {
+    pub fn new(id: usize, load_pattern: LoadPattern, limiter: Option<Arc<Limiter<LimitAlgo>>>) -> Self {
+        Self {
+            id,
+            load_pattern,
+            limiter,
+            active_from: Duration::ZERO,
+            active_until: None,
+        }
+    }
+
+    /// Set the time (from simulation start) at which this client begins generating requests.
+    pub fn active_from(mut self, t: Duration) -> Self {
+        self.active_from = t;
+        self
+    }
+
+    /// Set the time (from simulation start) at which this client stops generating requests.
+    pub fn active_until(mut self, t: Duration) -> Self {
+        self.active_until = Some(t);
+        self
+    }
+
     /// Try to immediately acquire a concurrency token.
     ///
     /// Returns `None` if the limiter is full.
