@@ -16,6 +16,12 @@ use crate::{
     simulation::Simulation,
 };
 
+/// Baseline round-trip network latency assumed between client and server.
+///
+/// Representative of intra-datacenter calls with connection pooling.
+/// TODO: expose same-host (~100µs) and same-rack (~500µs) variants.
+const INTRA_DC_NETWORK_LATENCY: Duration = Duration::from_millis(1);
+
 /// Build a limiter using the named algorithm with the given initial limit.
 ///
 /// Windowed variants use `min_window=1ms`, `max_window=1s`, and `Percentile` aggregation.
@@ -64,6 +70,7 @@ pub fn basic(seed: u64) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: None,
             limiter: None,
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: None,
         seed,
@@ -99,6 +106,7 @@ pub fn client_server(seed: u64, client_algo: &str, server_algo: &str) -> Simulat
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: Some(Duration::from_secs(1)),
             limiter: Some(server_limiter),
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: Some(Database::new(2, db_latency)),
         seed,
@@ -122,6 +130,7 @@ pub fn convergence_start_high(seed: u64, algo: &str) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: None,
             limiter: Some(server_limiter),
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: None,
         seed,
@@ -145,6 +154,7 @@ pub fn convergence_start_low(seed: u64, algo: &str) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: None,
             limiter: Some(server_limiter),
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: None,
         seed,
@@ -180,6 +190,7 @@ pub fn load(seed: u64, algo: &str) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: Some(Duration::from_secs(1)),
             limiter: None,
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: Some(Database::new(2, db_latency)),
         seed,
@@ -213,6 +224,7 @@ pub fn capacity(seed: u64, algo: &str) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: Some(Duration::from_secs(1)),
             limiter: None,
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: Some(db),
         seed,
@@ -241,6 +253,7 @@ pub fn high_variance(seed: u64, algo: &str) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: None,
             limiter: None,
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: None,
         seed,
@@ -290,6 +303,7 @@ pub fn fairness(seed: u64, algo: &str) -> Simulation {
             failure_rate: FailureRate::Constant(0.001),
             db_timeout: None,
             limiter: Some(server_limiter),
+            network_latency: INTRA_DC_NETWORK_LATENCY,
         },
         database: None,
         seed,

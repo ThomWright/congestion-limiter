@@ -90,14 +90,15 @@ pub async fn run(sim: &Simulation) -> Metrics {
                 let accepted = if let Some(db) = &sim.database {
                     match sim.server.try_acquire() {
                         None => {
-                            if let Some(t) = client_token {
-                                t.set_outcome(Outcome::Overload).await;
-                            }
                             metrics.record_rejection(
                                 now,
                                 client_id,
                                 RequestOutcome::ServerRejected,
                             );
+                            queue.push(Reverse(ScheduledEvent {
+                                time: now + sim.server.network_latency,
+                                event: Event::NetworkReturn { client_token },
+                            }));
                             None
                         }
                         Some(server_token) => {
@@ -115,14 +116,15 @@ pub async fn run(sim: &Simulation) -> Metrics {
                 } else {
                     match sim.server.try_accept(&mut rng) {
                         None => {
-                            if let Some(t) = client_token {
-                                t.set_outcome(Outcome::Overload).await;
-                            }
                             metrics.record_rejection(
                                 now,
                                 client_id,
                                 RequestOutcome::ServerRejected,
                             );
+                            queue.push(Reverse(ScheduledEvent {
+                                time: now + sim.server.network_latency,
+                                event: Event::NetworkReturn { client_token },
+                            }));
                             None
                         }
                         Some((server_token, latency)) => {
@@ -134,7 +136,7 @@ pub async fn run(sim: &Simulation) -> Metrics {
 
                 if let Some((server_token, client_token, latency, outcome, has_db)) = accepted {
                     queue.push(Reverse(ScheduledEvent {
-                        time: now + latency,
+                        time: now + latency + sim.server.network_latency,
                         event: Event::Complete {
                             client_id,
                             start_time: now,
@@ -183,6 +185,12 @@ pub async fn run(sim: &Simulation) -> Metrics {
                 let elapsed = now.duration_since(start);
                 metrics.record_request(now, client_id, start_time, outcome);
                 snapshot_all(now, elapsed, sim, &mut metrics);
+            }
+
+            Event::NetworkReturn { client_token, .. } => {
+                if let Some(t) = client_token {
+                    t.set_outcome(Outcome::Overload).await;
+                }
             }
 
             Event::CapacityChange { workers } => {

@@ -45,6 +45,12 @@ pub struct Server {
     /// Timeout applied to database queries. Exceeded queries return `Overload`.
     pub db_timeout: Option<Duration>,
     pub limiter: Option<Arc<Limiter<LimitAlgo>>>,
+    /// Round-trip network latency between client and server.
+    ///
+    /// Added to every interaction the client observes — both completions and rejections —
+    /// so that rejection signals are not mistaken for zero-latency local errors by
+    /// windowed limit algorithms.
+    pub network_latency: Duration,
 }
 
 impl Server {
