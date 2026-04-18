@@ -8,7 +8,6 @@ use statrs::distribution::Erlang;
 
 /// A database with a worker pool modelled as an M/M/c queue.
 ///
-///
 /// Latency increases as the number of in-flight requests approaches the worker count. Beyond that
 /// point, requests queue and each additional batch of `c` requests adds another full service round
 /// to the wait time.
@@ -22,7 +21,7 @@ pub struct Database {
     pub base_latency: Erlang,
     in_flight: AtomicUsize,
     /// Scheduled worker-count changes: `(offset_from_start, new_worker_count)`.
-    pub capacity_timeline: Vec<(Duration, usize)>,
+    capacity_timeline: Vec<(Duration, usize)>,
 }
 
 impl Database {
