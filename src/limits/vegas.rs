@@ -216,8 +216,15 @@ impl LimitAlgorithm for Vegas {
 
         let current_limit = self.limit.load(Ordering::Acquire);
         inner.samples_since_probe += 1;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "jitter is 0 <= 1.0, so this won't lose precision, truncate, or change sign"
+        )]
         let probe_interval =
-            (inner.probe_jitter * self.probe_multiplier as f64 * current_limit as f64) as usize;
+            (inner.probe_jitter * self.probe_multiplier as f64 * current_limit as f64).round()
+                as usize;
         if inner.samples_since_probe >= probe_interval {
             // Probe: reset the baseline to the current sample and leave the limit unchanged.
             // This prevents the all-time minimum from drifting arbitrarily low over long runs.
