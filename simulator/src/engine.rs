@@ -36,6 +36,16 @@ pub async fn run(sim: &Simulation) -> Metrics {
         event: Event::End,
     }));
 
+    // Schedule database capacity changes.
+    if let Some(db) = &sim.database {
+        for &(offset, workers) in db.capacity_timeline() {
+            queue.push(Reverse(ScheduledEvent {
+                time: start + offset,
+                event: Event::CapacityChange { workers },
+            }));
+        }
+    }
+
     while let Some(Reverse(scheduled)) = queue.pop() {
         let dt = scheduled.time.duration_since(Instant::now());
         tokio::time::advance(dt).await;
@@ -170,6 +180,12 @@ pub async fn run(sim: &Simulation) -> Metrics {
                 };
                 metrics.record_request(now, client_id, start_time, outcome);
                 snapshot_all(now, sim, &mut metrics);
+            }
+
+            Event::CapacityChange { workers } => {
+                if let Some(db) = &sim.database {
+                    db.set_workers(workers);
+                }
             }
 
             Event::End => break,

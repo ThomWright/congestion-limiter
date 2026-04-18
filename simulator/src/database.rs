@@ -18,7 +18,7 @@ pub struct Database {
     /// Number of parallel workers (connection pool size, `c` in M/M/c).
     workers: AtomicUsize,
     /// Service time distribution per worker.
-    pub base_latency: Erlang,
+    base_latency: Erlang,
     in_flight: AtomicUsize,
     /// Scheduled worker-count changes: `(offset_from_start, new_worker_count)`.
     capacity_timeline: Vec<(Duration, usize)>,
@@ -46,6 +46,11 @@ impl Database {
 
     pub fn set_workers(&self, n: usize) {
         self.workers.store(n, Ordering::Release);
+    }
+
+    /// The scheduled worker-count changes for this database.
+    pub fn capacity_timeline(&self) -> &[(Duration, usize)] {
+        &self.capacity_timeline
     }
 
     pub fn in_flight(&self) -> usize {

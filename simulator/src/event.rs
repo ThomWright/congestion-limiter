@@ -21,6 +21,9 @@ pub enum Event {
         has_db: bool,
     },
 
+    /// Change the database's worker count at a pre-scheduled simulation time.
+    CapacityChange { workers: usize },
+
     /// The simulation has reached its configured end time.
     End,
 }
