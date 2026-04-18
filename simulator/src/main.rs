@@ -62,11 +62,10 @@ fn main() {
         }
         ("convergence_start_high", Some(c), _) => scenarios::convergence_start_high(seed, c),
         ("convergence_start_low", Some(c), _) => scenarios::convergence_start_low(seed, c),
-        ("ramp", Some(c), _) => scenarios::ramp(seed, c),
-        ("spike", Some(c), _) => scenarios::spike(seed, c),
+        ("load", Some(c), _) => scenarios::load(seed, c),
         ("high_variance", Some(c), _) => scenarios::high_variance(seed, c),
         ("fairness", Some(c), _) => scenarios::fairness(seed, c),
-        (s @ ("convergence_start_high" | "convergence_start_low" | "ramp" | "spike" | "high_variance" | "fairness"), None, _) => {
+        (s @ ("convergence_start_high" | "convergence_start_low" | "load" | "high_variance" | "fairness"), None, _) => {
             eprintln!("Scenario '{s}' requires --client-algo <name>");
             eprintln!("Available algorithms: aimd, windowed_aimd, vegas, windowed_vegas, gradient, windowed_gradient");
             std::process::exit(1);
@@ -74,7 +73,7 @@ fn main() {
         (other, _, _) => {
             eprintln!("Unknown scenario: {other}");
             eprintln!("Available scenarios: basic, client_server");
-            eprintln!("Scenarios requiring --client-algo: convergence_start_high, convergence_start_low, ramp, spike, high_variance, fairness");
+            eprintln!("Scenarios requiring --client-algo: convergence_start_high, convergence_start_low, load, high_variance, fairness");
             std::process::exit(1);
         }
     };

@@ -151,54 +151,27 @@ pub fn convergence_start_low(seed: u64, algo: &str) -> Simulation {
     }
 }
 
-/// Tests how algorithms track two load cycles, each ramping past capacity and back.
+/// Tests algorithm tracking under both gradual and sudden load changes.
 ///
-/// Two full up/down cycles: 1→200 rps over 90s then 200→1 over 90s, repeated.
-/// Server + DB capacity ≈ 100 rps. Tests convergence, recovery, and whether the
-/// latency baseline resets correctly between cycles.
-pub fn ramp(seed: u64, algo: &str) -> Simulation {
-    let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
-
-    Simulation {
-        duration: Duration::from_secs(360),
-        clients: vec![Client::new(
-            0,
-            LoadPattern::segments(vec![
-                (Duration::from_secs(90), 200.0),  // ramp up   1→200
-                (Duration::from_secs(90), 1.0),    // ramp down 200→1
-                (Duration::from_secs(90), 200.0),  // ramp up   1→200
-                (Duration::from_secs(90), 1.0),    // ramp down 200→1
-            ]),
-            Some(build_limiter(algo, 10)),
-        )],
-        server: Server {
-            latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
-            failure_rate: FailureRate::Constant(0.001),
-            db_timeout: Some(Duration::from_secs(1)),
-            limiter: None,
-        },
-        database: Some(Database::new(2, db_latency)),
-        seed,
-    }
-}
-
-/// Tests reaction to two sudden load spikes with recovery between them.
-///
-/// Load steps: 30 rps for 30s → 300 rps for 90s → 30 rps for 90s → 300 rps for 90s
-/// → 30 rps for 90s. Server + DB capacity ≈ 100 rps.
-pub fn spike(seed: u64, algo: &str) -> Simulation {
+/// Constant capacity (DB, 2 workers, ~100 rps). Load ramps up to 2× capacity and back,
+/// then spikes to 3× capacity and recovers. Tests convergence, recovery, and whether
+/// the latency baseline resets correctly between phases.
+pub fn load(seed: u64, algo: &str) -> Simulation {
     let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
 
     Simulation {
         duration: Duration::from_secs(390),
         clients: vec![Client::new(
             0,
-            LoadPattern::step(vec![
-                (Duration::from_secs(30), 30.0),
-                (Duration::from_secs(90), 300.0),
-                (Duration::from_secs(90), 30.0),
-                (Duration::from_secs(90), 300.0),
-                (Duration::from_secs(90), 30.0),
+            LoadPattern::segments(vec![
+                (Duration::from_secs(90), 200.0),  // ramp up   1→200
+                (Duration::from_secs(90), 1.0),    // ramp down 200→1
+                (Duration::ZERO, 30.0),             // instant step to 30
+                (Duration::from_secs(30), 30.0),   // hold at 30 (calm before spike)
+                (Duration::ZERO, 300.0),            // instant spike to 300
+                (Duration::from_secs(90), 300.0),  // hold spike
+                (Duration::ZERO, 30.0),             // instant drop to 30
+                (Duration::from_secs(90), 30.0),   // recovery
             ]),
             Some(build_limiter(algo, 10)),
         )],
