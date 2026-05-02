@@ -228,14 +228,21 @@ impl LimitAlgorithm for Vegas {
         if inner.samples_since_probe >= probe_interval {
             // Probe: reset the baseline to the current sample and leave the limit unchanged.
             // This prevents the all-time minimum from drifting arbitrarily low over long runs.
-            inner.base_latency = sample.latency;
-            inner.samples_since_probe = 0;
-            inner.probe_jitter = rand::thread_rng().gen_range(0.5..1.0);
-            return current_limit;
+            // Only reset from successful samples: an overload (rejection or timeout) reflects
+            // queueing or server state, not the underlying no-load service time.
+            if sample.outcome != Outcome::Overload {
+                inner.base_latency = sample.latency;
+                inner.samples_since_probe = 0;
+                inner.probe_jitter = rand::thread_rng().gen_range(0.5..1.0);
+                return current_limit;
+            }
         }
 
-        if sample.latency < inner.base_latency {
+        if sample.latency < inner.base_latency && sample.outcome != Outcome::Overload {
             // Record a baseline "no load" latency and keep the limit.
+            // Only update from successful samples: an overload reflects a queued or rejected
+            // request, not the true service time, and its low observed latency would corrupt
+            // the baseline used to estimate queueing delay.
             inner.base_latency = sample.latency;
             return self.limit.load(Ordering::Acquire);
         }
@@ -360,6 +367,39 @@ mod tests {
         assert!(
             limiter.state().limit() < higher_limit,
             "Increased latency => decrease limit"
+        );
+    }
+
+    /// Verifies the latency-based (beta) decrease path specifically.
+    ///
+    /// Requires in_flight × (1 − base/latency) > beta(limit). Uses a high initial limit with
+    /// saturated concurrency so the estimate can exceed the threshold on a 3× latency spike.
+    #[tokio::test]
+    async fn latency_increase_decreases_limit() {
+        let vegas = Vegas::new_with_initial_limit(20);
+        let limiter = Limiter::builder().limit_algo(vegas).build();
+
+        // Set base_latency at low utilisation (< 0.5) so the limit stays at 20.
+        let tokens: Vec<_> = (0..5).map(|_| limiter.try_acquire().unwrap()).collect();
+        for mut t in tokens {
+            t.set_latency(Duration::from_millis(25));
+            t.set_outcome(Outcome::Success).await;
+        }
+        assert_eq!(limiter.state().limit(), 20, "Low utilisation => no change");
+
+        // 3× latency at full concurrency.
+        //   estimated_queued ≈ in_flight × (1 − 25/75) ≈ 19 × 0.667 ≈ 12.7
+        //   beta(20) = DEFAULT_BETA_MULTIPLIER × log10(20) ≈ 11.7
+        //   → decrease
+        let tokens: Vec<_> = (0..20).map(|_| limiter.try_acquire().unwrap()).collect();
+        for mut t in tokens {
+            t.set_latency(Duration::from_millis(75));
+            t.set_outcome(Outcome::Success).await;
+        }
+        assert!(
+            limiter.state().limit() < 20,
+            "3× latency at capacity => latency-based decrease. Limit: {}",
+            limiter.state().limit()
         );
     }
 
