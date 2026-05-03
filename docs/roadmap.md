@@ -9,7 +9,7 @@
             _This way the limit won't be updated on every sample_
         - Just move the short window to the Windowed wrapper!
     - [x] Vegas
-      - [ ] Probe min. latency
+      - [x] Probe min. latency
       - [ ] Support fast start
   - [x] Windowed wrapper
     - [x] Percentile sampler
@@ -18,15 +18,11 @@
 - [ ] Tests
   - [x] Vegas
 - [ ] Simulator:
-  - [ ] Topology
-    - [ ] `Source` and `Sink` interfaces?
-    - [ ] `LoadSource -> Option<ClientLimiter> -> Option<ServerLimiter> -> Server`?
-    - [ ] `Server -> *Servers`?
-  - [ ] LoadSource - cycle through behaviours, e.g. 100 RPS for 10 seconds, 0 RPS for 2 seconds
-  - [ ] Results
-    - [ ] Each node keep track of own metrics?
-    - [ ] Graphs
-  - [ ] Test fairness
+  - [x] Load source with configurable phases (constant, step, ramped segments)
+  - [x] Per-node metrics and gnuplot output
+  - [x] Fairness, convergence, load, capacity, and high-variance scenarios
+  - [ ] Latency heatmap panel in gnuplot output (`plot.gnu`), using `requests.dat` columns
+  - [ ] Low-variance latency scenario (for Vegas — stable RTT baseline)
 - [ ] Limiter
   - [x] Rejection delay
     - Option to add delay before rejecting jobs. Intended to slow down clients, e.g. RabbitMQ retries.
