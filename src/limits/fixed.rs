@@ -7,6 +7,10 @@ use super::{LimitAlgorithm, Sample};
 pub struct Fixed(usize);
 impl Fixed {
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    #[must_use]
     pub fn new(limit: usize) -> Self {
         assert!(limit > 0);
 

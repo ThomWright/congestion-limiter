@@ -44,14 +44,26 @@ impl ExpSmoothed {
 
             self.value = self.initial_sum / self.initial_count.into();
         } else if sample >= self.value {
-            self.value = self.value + (sample - self.value).mul_f64(self.smoothing_factor);
+            self.value = self.value
+                + sample
+                    .checked_sub(self.value)
+                    .unwrap()
+                    .mul_f64(self.smoothing_factor);
         } else {
-            self.value = self.value - (self.value - sample).mul_f64(self.smoothing_factor);
+            self.value = self
+                .value
+                .checked_sub(
+                    self.value
+                        .checked_sub(sample)
+                        .unwrap()
+                        .mul_f64(self.smoothing_factor),
+                )
+                .unwrap();
         }
         self.value
     }
 
-    pub fn set(&mut self, value: Duration) {
+    pub const fn set(&mut self, value: Duration) {
         self.value = value;
     }
 
@@ -94,10 +106,10 @@ impl Simple {
 
         if count >= self.window_size.into() {
             let prev = self.values.pop_front().expect("should be non-empty");
-            self.avg += (sample - prev) / count;
+            self.avg += sample.checked_sub(prev).unwrap() / count;
         } else {
             self.avg = (sample + (count * self.avg)) / (count + 1);
-        };
+        }
 
         self.values.push_back(sample);
 

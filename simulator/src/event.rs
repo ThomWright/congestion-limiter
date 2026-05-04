@@ -26,9 +26,7 @@ pub enum Event {
     /// Scheduled at `now + network_latency` so the client token observes realistic
     /// latency rather than zero, preventing windowed algorithms from discarding the
     /// overload signal.
-    NetworkReturn {
-        client_token: Option<Token>,
-    },
+    NetworkReturn { client_token: Option<Token> },
 
     /// Change the database's worker count at a pre-scheduled simulation time.
     CapacityChange { workers: usize },

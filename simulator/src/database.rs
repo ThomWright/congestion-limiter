@@ -25,7 +25,7 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(workers: usize, base_latency: Erlang) -> Self {
+    pub const fn new(workers: usize, base_latency: Erlang) -> Self {
         Self {
             workers: AtomicUsize::new(workers),
             base_latency,
@@ -66,6 +66,12 @@ impl Database {
         let n = self.in_flight.fetch_add(1, Ordering::AcqRel);
         let service_time = Duration::from_secs_f64(self.base_latency.sample(rng));
         let workers = self.workers.load(Ordering::Acquire).max(1);
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "n and workers are request/worker counts bounded well within f64 precision; ceil() is always >= 0 and the result fits in u32 for any realistic concurrency level"
+        )]
         let rounds = ((n + 1) as f64 / workers as f64).ceil() as u32;
         service_time * rounds
     }

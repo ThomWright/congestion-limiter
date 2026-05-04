@@ -48,6 +48,10 @@ impl Aggregator for Average {
         self.samples += 1;
         Sample {
             in_flight: (self.in_flight_sum / self.samples as u128) as usize,
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "sample count is window-bounded, well within f64 precision"
+            )]
             latency: self.latency_sum.div_f64(self.samples as f64),
             outcome: self.overload,
         }
@@ -75,6 +79,10 @@ impl Default for Average {
 
 impl Percentile {
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `percentile` is not in the range `(0, 1)` exclusive.
+    #[must_use]
     pub fn new(percentile: f64) -> Self {
         assert!(
             percentile > 0. && percentile < 1.,
@@ -102,6 +110,10 @@ impl Percentile {
             return None;
         }
 
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "sample count is window-bounded, well within f64 precision"
+        )]
         let float_index = self.num_samples as f64 * self.percentile;
 
         Some(
@@ -164,6 +176,7 @@ impl Debug for Percentile {
         f.debug_struct("Percentile")
             .field("percentile", &self.percentile)
             .field("overload", &self.overload)
+            .field("num_samples", &self.num_samples)
             .field("samples", &self.samples)
             .field("(aggregated sample)", &self.percentile_sample())
             .finish()
@@ -232,7 +245,7 @@ mod tests {
                 outcome: Outcome::Success,
             },
             "should be equal to new sample after reset"
-        )
+        );
     }
 
     #[tokio::test]
@@ -300,6 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::float_cmp)]
     async fn percentile_reset() {
         let mut aggregator = Percentile::new(0.99);
 

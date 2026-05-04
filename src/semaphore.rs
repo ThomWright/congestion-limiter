@@ -21,8 +21,8 @@ use std::{
     collections::VecDeque,
     future::Future,
     sync::{
-        atomic::{self, AtomicBool},
         Arc, Mutex,
+        atomic::{self, AtomicBool},
     },
 };
 
@@ -305,17 +305,17 @@ impl WeightedSemaphore {
         // Case 3: home pool has spare — lend to another pool's waiter.
         // Home's queue is empty (case 2 was false), so dequeue_highest_priority
         // will only pick from other pools.
-        if state.pools[home].available >= buffer(state.pools[home].limit) {
-            if let Some((waiter_pool, entry)) = Self::dequeue_highest_priority(&mut state.pools) {
-                state.pools[waiter_pool].in_flight += 1;
-                drop(state);
-                let _ = entry.sender.send(Ok(Permit {
-                    semaphore: Some(Arc::clone(&self)),
-                    home_pool: home,
-                    user_pool: waiter_pool,
-                }));
-                return;
-            }
+        if state.pools[home].available >= buffer(state.pools[home].limit)
+            && let Some((waiter_pool, entry)) = Self::dequeue_highest_priority(&mut state.pools)
+        {
+            state.pools[waiter_pool].in_flight += 1;
+            drop(state);
+            let _ = entry.sender.send(Ok(Permit {
+                semaphore: Some(Arc::clone(&self)),
+                home_pool: home,
+                user_pool: waiter_pool,
+            }));
+            return;
         }
 
         // Case 4: return to home pool's available.
@@ -395,13 +395,14 @@ impl WeightedSemaphore {
         if let Ok(index) = entries.binary_search_by_key(&id, |entry| entry.id) {
             entries.remove(index);
         }
+        drop(state);
     }
 
     fn close(&self) {
         self.closed.store(true, atomic::Ordering::Release);
 
         let mut state = self.state.lock().expect("lock should not be poisoned");
-        for sub in state.pools.iter_mut() {
+        for sub in &mut state.pools {
             for entry in sub.queue.drain(..) {
                 let _ = entry.sender.send(Err(AcquireError::Closed));
             }
@@ -423,17 +424,21 @@ impl WeightedSemaphore {
 /// Buffer threshold for a pool: 10% of the limit (rounded up).
 ///
 /// A pool must keep at least this many permits available before lending to others.
-pub(crate) fn buffer(limit: usize) -> usize {
+pub const fn buffer(limit: usize) -> usize {
     limit.div_ceil(10)
 }
 
 /// Distribute `total` across `weights.len()` buckets proportional to each weight,
 /// using the largest remainder method so the sum is exactly `total`.
-pub(crate) fn distribute(total: usize, weights: &[f64]) -> Vec<usize> {
+pub fn distribute(total: usize, weights: &[f64]) -> Vec<usize> {
     assert!(!weights.is_empty());
     let sum: f64 = weights.iter().sum();
     assert!(sum > 0.0, "weights must sum to a positive value");
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "total is a concurrency limit bounded well within f64 precision"
+    )]
     let exact: Vec<f64> = weights.iter().map(|w| (w / sum) * total as f64).collect();
     #[allow(
         clippy::cast_possible_truncation,
@@ -441,6 +446,10 @@ pub(crate) fn distribute(total: usize, weights: &[f64]) -> Vec<usize> {
         reason = "weights are non-negative so floor() is always non-negative and fits in usize"
     )]
     let floors: Vec<usize> = exact.iter().map(|v| v.floor() as usize).collect();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "floors are integer parts of bounded f64 values, exact conversion"
+    )]
     let mut remainders: Vec<(usize, f64)> = exact
         .iter()
         .zip(floors.iter())
@@ -468,7 +477,7 @@ impl Drop for WeightedSemaphore {
 }
 
 impl Acquire {
-    fn new(
+    const fn new(
         semaphore: Arc<WeightedSemaphore>,
         receiver: oneshot::Receiver<Result<Permit, AcquireError>>,
         id: EntryId,
@@ -570,7 +579,7 @@ mod tests {
             let p2 = semaphore.clone().try_acquire(0);
             assert!(p2.is_err());
         }
-        let p = semaphore.clone().try_acquire(0);
+        let p = semaphore.try_acquire(0);
         assert!(p.is_ok());
     }
 
@@ -1148,7 +1157,7 @@ mod tests {
 
         // Pool 0 is exhausted; eligible donors are pool 1 (available=2 > buffer(2)=1)
         // and pool 2 (available=3 > buffer(3)=1). Pool 1 has the lower weight.
-        let borrowed = semaphore.clone().try_acquire(0).unwrap();
+        let borrowed = semaphore.try_acquire(0).unwrap();
 
         // The permit should be homed in pool 1, not pool 2.
         assert_eq!(borrowed.home_pool, 1);

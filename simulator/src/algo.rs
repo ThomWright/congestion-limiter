@@ -20,25 +20,25 @@ pub enum LimitAlgo {
 impl LimitAlgorithm for LimitAlgo {
     fn limit(&self) -> usize {
         match self {
-            LimitAlgo::Aimd(a) => a.limit(),
-            LimitAlgo::WindowedAimd(w) => w.limit(),
-            LimitAlgo::Vegas(v) => v.limit(),
-            LimitAlgo::WindowedVegas(w) => w.limit(),
-            LimitAlgo::Gradient(g) => g.limit(),
-            LimitAlgo::WindowedGradient(w) => w.limit(),
-            LimitAlgo::Fixed(f) => f.limit(),
+            Self::Aimd(a) => a.limit(),
+            Self::WindowedAimd(w) => w.limit(),
+            Self::Vegas(v) => v.limit(),
+            Self::WindowedVegas(w) => w.limit(),
+            Self::Gradient(g) => g.limit(),
+            Self::WindowedGradient(w) => w.limit(),
+            Self::Fixed(f) => f.limit(),
         }
     }
 
     async fn update(&self, sample: Sample) -> usize {
         match self {
-            LimitAlgo::Aimd(a) => a.update(sample).await,
-            LimitAlgo::WindowedAimd(w) => w.update(sample).await,
-            LimitAlgo::Vegas(v) => v.update(sample).await,
-            LimitAlgo::WindowedVegas(w) => w.update(sample).await,
-            LimitAlgo::Gradient(g) => g.update(sample).await,
-            LimitAlgo::WindowedGradient(w) => w.update(sample).await,
-            LimitAlgo::Fixed(f) => f.update(sample).await,
+            Self::Aimd(a) => a.update(sample).await,
+            Self::WindowedAimd(w) => w.update(sample).await,
+            Self::Vegas(v) => v.update(sample).await,
+            Self::WindowedVegas(w) => w.update(sample).await,
+            Self::Gradient(g) => g.update(sample).await,
+            Self::WindowedGradient(w) => w.update(sample).await,
+            Self::Fixed(f) => f.update(sample).await,
         }
     }
 }

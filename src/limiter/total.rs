@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    sync::{atomic, Arc},
+    sync::{Arc, atomic},
     time::Duration,
 };
 
@@ -13,7 +13,7 @@ use super::{AtomicCapacityUnit, CapacityUnit, Outcome};
 
 /// A limiter for total capacity (as opposed to partitions on top).
 #[derive(Debug)]
-pub(crate) struct TotalLimiter<T> {
+pub struct TotalLimiter<T> {
     limit_algo: T,
     semaphore: Arc<WeightedSemaphore>,
     limit: AtomicCapacityUnit,
@@ -33,7 +33,7 @@ where
         let initial_permits = limit_algo.limit();
         assert!(initial_permits >= 1);
 
-        TotalLimiter {
+        Self {
             limit_algo,
             semaphore: Arc::new(
                 WeightedSemaphore::builder()
@@ -53,7 +53,7 @@ where
         let initial_permits = limit_algo.limit();
         assert!(initial_permits >= 1);
 
-        TotalLimiter {
+        Self {
             limit_algo,
             semaphore: Arc::new(
                 WeightedSemaphore::builder()
@@ -182,7 +182,7 @@ mod tests {
 
     use crate::{
         limiter::Outcome,
-        limits::{mock::MockLimitAlgorithm, LimitAlgorithm, Sample},
+        limits::{LimitAlgorithm, Sample, mock::MockLimitAlgorithm},
     };
 
     use super::TotalLimiter;
@@ -225,7 +225,7 @@ mod tests {
         limiter.release(permit);
 
         assert_eq!(
-            mock_algo.samples().await,
+            mock_algo.samples(),
             vec![Sample {
                 in_flight: 1,
                 latency: Duration::from_secs(1),

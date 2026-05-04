@@ -1,8 +1,8 @@
 use std::{
     ops::RangeInclusive,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -11,11 +11,11 @@ use conv::ConvAsUtil;
 
 use crate::{
     limiter::Outcome,
-    limits::{defaults, Sample},
+    limits::{Sample, defaults},
     moving_avg,
 };
 
-use super::{defaults::MIN_SAMPLE_LATENCY, LimitAlgorithm};
+use super::{LimitAlgorithm, defaults::MIN_SAMPLE_LATENCY};
 
 /// Delay-based congestion avoidance.
 ///
@@ -60,6 +60,7 @@ impl Gradient {
     const DEFAULT_BACKOFF_RATIO: f64 = 0.9;
 
     #[allow(missing_docs)]
+    #[must_use]
     pub fn new_with_initial_limit(initial_limit: usize) -> Self {
         Self::new(
             initial_limit,
@@ -68,6 +69,10 @@ impl Gradient {
     }
 
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `limit_range` start is less than 1, or if `initial_limit` is outside `limit_range`.
+    #[must_use]
     pub fn new(initial_limit: usize, limit_range: RangeInclusive<usize>) -> Self {
         assert!(*limit_range.start() >= 1, "Limits must be at least 1");
         assert!(
@@ -88,12 +93,20 @@ impl Gradient {
                 long_window_latency: moving_avg::ExpSmoothed::new_with_window_size(
                     Self::DEFAULT_LONG_WINDOW_SAMPLES,
                 ),
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "concurrency limit is bounded well within f64 precision"
+                )]
                 limit: initial_limit as f64,
             }),
         }
     }
 
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `max` is 0.
+    #[must_use]
     pub fn with_max_limit(self, max: usize) -> Self {
         assert!(max > 0);
         Self {
@@ -143,6 +156,10 @@ impl LimitAlgorithm for Gradient {
             let gradient = (Self::DEFAULT_TOLERANCE * ratio).clamp(0.5, 1.0);
 
             // Don't adjust the limit when utilisation is too low — not enough signal.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "in_flight is a concurrency value bounded well within f64 precision"
+            )]
             let utilisation = sample.in_flight as f64 / old_limit;
             if utilisation < Self::DEFAULT_MIN_UTILISATION {
                 return self.limit.load(Ordering::Acquire);
@@ -156,18 +173,26 @@ impl LimitAlgorithm for Gradient {
                 0.0
             };
 
-            old_limit * gradient + increase
+            old_limit.mul_add(gradient, increase)
         };
 
         // Apply smoothing only on the way down to avoid slowing recovery.
         if new_limit < old_limit {
-            new_limit =
-                old_limit * (1.0 - Self::DEFAULT_SMOOTHING) + new_limit * Self::DEFAULT_SMOOTHING;
+            new_limit = old_limit.mul_add(
+                1.0 - Self::DEFAULT_SMOOTHING,
+                new_limit * Self::DEFAULT_SMOOTHING,
+            );
         }
 
-        new_limit = (new_limit).clamp(self.min_limit as f64, self.max_limit as f64);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "concurrency limits are bounded well within f64 precision"
+        )]
+        let limit_range = self.min_limit as f64..=self.max_limit as f64;
+        new_limit = new_limit.clamp(*limit_range.start(), *limit_range.end());
 
         inner.limit = new_limit;
+        drop(inner);
 
         let rounded_limit = new_limit
             .approx()

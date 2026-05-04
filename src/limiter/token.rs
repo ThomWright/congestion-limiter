@@ -52,7 +52,7 @@ impl Token {
     }
 
     #[cfg(test)]
-    pub(crate) fn latency(&self) -> Duration {
+    pub(crate) const fn latency(&self) -> Duration {
         self.latency
     }
 
@@ -65,6 +65,6 @@ impl Token {
 impl Drop for Token {
     fn drop(&mut self) {
         self.releaser
-            .release(self.permit.take().expect("permit should exist until drop"))
+            .release(self.permit.take().expect("permit should exist until drop"));
     }
 }

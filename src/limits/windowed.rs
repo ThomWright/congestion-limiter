@@ -5,7 +5,7 @@ use tokio::{sync::Mutex, time::Instant};
 
 use crate::aggregation::Aggregator;
 
-use super::{defaults::MIN_SAMPLE_LATENCY, LimitAlgorithm, Sample};
+use super::{LimitAlgorithm, Sample, defaults::MIN_SAMPLE_LATENCY};
 
 /// A wrapper around a [LimitAlgorithm] which aggregates samples within a window, periodically
 /// updating the limit.
@@ -66,6 +66,11 @@ impl<L: LimitAlgorithm, S: Aggregator> Windowed<L, S> {
     }
 
     /// At least this many samples need to be aggregated before updating the limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `samples` is 0.
+    #[must_use]
     pub fn with_min_samples(mut self, samples: usize) -> Self {
         assert!(samples > 0, "at least one sample required per window");
         self.min_samples = samples;
@@ -73,7 +78,8 @@ impl<L: LimitAlgorithm, S: Aggregator> Windowed<L, S> {
     }
 
     /// Minimum time to wait before attempting to update the limit.
-    pub fn with_min_window(mut self, min: Duration) -> Self {
+    #[must_use]
+    pub const fn with_min_window(mut self, min: Duration) -> Self {
         self.window_bounds = min..=*self.window_bounds.end();
         self
     }
@@ -82,7 +88,8 @@ impl<L: LimitAlgorithm, S: Aggregator> Windowed<L, S> {
     ///
     /// Will wait for longer if not enough samples have been aggregated. See
     /// [with_min_samples()](Self::with_min_samples()).
-    pub fn with_max_window(mut self, max: Duration) -> Self {
+    #[must_use]
+    pub const fn with_max_window(mut self, max: Duration) -> Self {
         self.window_bounds = *self.window_bounds.start()..=max;
         self
     }
@@ -113,6 +120,7 @@ where
             && window.start.elapsed() >= window.duration
         {
             window.reset(&self.window_bounds);
+            drop(window);
 
             self.inner.update(agg_sample).await
         } else {
@@ -171,7 +179,12 @@ mod tests {
         windowed.update(sample).await;
 
         // Advance to just before 2 × min_latency — second window should still be open.
-        tokio::time::advance(min_latency * 2 - Duration::from_millis(1)).await;
+        tokio::time::advance(
+            (min_latency * 2)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        )
+        .await;
         let limit_before = windowed.update(sample).await;
         assert_eq!(limit_before, 10, "window should still be open");
 

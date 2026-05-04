@@ -15,12 +15,12 @@ pub enum RequestOutcome {
 }
 
 impl RequestOutcome {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            RequestOutcome::Success => "success",
-            RequestOutcome::ClientRejected => "client_rejected",
-            RequestOutcome::ServerRejected => "server_rejected",
-            RequestOutcome::Overload => "overload",
+            Self::Success => "success",
+            Self::ClientRejected => "client_rejected",
+            Self::ServerRejected => "server_rejected",
+            Self::Overload => "overload",
         }
     }
 }
@@ -52,7 +52,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(start: Instant) -> Self {
+    pub const fn new(start: Instant) -> Self {
         Self {
             requests: Vec::new(),
             snapshots: Vec::new(),

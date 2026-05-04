@@ -7,7 +7,7 @@
 cargo test --lib path::to::module::test_name -- --nocapture
 
 # Lint
-cargo clippy --all-features -- --deny warnings
+cargo clippy --all-features --all-targets --workspace -- --deny warnings
 ```
 
 ## Introduction

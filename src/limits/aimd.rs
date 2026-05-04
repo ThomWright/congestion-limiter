@@ -8,7 +8,7 @@ use conv::ConvAsUtil;
 
 use crate::{limiter::Outcome, limits::Sample};
 
-use super::{defaults, LimitAlgorithm};
+use super::{LimitAlgorithm, defaults};
 
 /// Loss-based overload avoidance.
 ///
@@ -36,6 +36,7 @@ impl Aimd {
     const DEFAULT_INCREASE_MIN_UTILISATION: f64 = 0.8;
 
     #[allow(missing_docs)]
+    #[must_use]
     pub fn new_with_initial_limit(initial_limit: usize) -> Self {
         Self::new(
             initial_limit,
@@ -44,6 +45,10 @@ impl Aimd {
     }
 
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `limit_range` start is less than 1, or if `initial_limit` is outside `limit_range`.
+    #[must_use]
     pub fn new(initial_limit: usize, limit_range: RangeInclusive<usize>) -> Self {
         assert!(*limit_range.start() >= 1, "Limits must be at least 1");
         assert!(
@@ -67,6 +72,11 @@ impl Aimd {
     }
 
     /// Set the multiplier which will be applied when decreasing the limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor` is not in the range `[0.5, 1.0)`.
+    #[must_use]
     pub fn decrease_factor(self, factor: f64) -> Self {
         assert!((0.5..1.0).contains(&factor));
         Self {
@@ -76,6 +86,11 @@ impl Aimd {
     }
 
     /// Set the increment which will be applied when increasing the limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `increase` is 0.
+    #[must_use]
     pub fn increase_by(self, increase: usize) -> Self {
         assert!(increase > 0);
         Self {
@@ -85,6 +100,10 @@ impl Aimd {
     }
 
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `max` is 0.
+    #[must_use]
     pub fn with_max_limit(self, max: usize) -> Self {
         assert!(max > 0);
         Self {
@@ -94,6 +113,11 @@ impl Aimd {
     }
 
     /// A threshold below which the limit won't be increased. 0.5 = 50%.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_util` is not in the range `(0, 1)` exclusive.
+    #[must_use]
     pub fn with_min_utilisation_threshold(self, min_util: f64) -> Self {
         assert!(min_util > 0. && min_util < 1.);
         Self {
@@ -110,11 +134,12 @@ impl LimitAlgorithm for Aimd {
     }
 
     async fn update(&self, sample: Sample) -> usize {
-        use Outcome::*;
+        use Outcome::{Overload, Success};
         match sample.outcome {
             Success => {
                 self.limit
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |limit| {
+                        #[allow(clippy::cast_precision_loss, reason = "in_flight and limit are concurrency values bounded well within f64 precision")]
                         let utilisation = sample.in_flight as f64 / limit as f64;
 
                         if utilisation > self.min_utilisation_threshold {
@@ -143,6 +168,10 @@ impl LimitAlgorithm for Aimd {
 pub(super) fn multiplicative_decrease(limit: usize, decrease_factor: f64) -> usize {
     assert!(decrease_factor <= 1.0, "should not increase the limit");
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "concurrency limit is bounded well within f64 precision"
+    )]
     let limit = limit as f64 * decrease_factor;
 
     // Floor instead of round, so the limit reduces even with small numbers.

@@ -2,8 +2,8 @@ use std::{
     fmt::Debug,
     ops::RangeInclusive,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -13,7 +13,7 @@ use rand::Rng;
 
 use crate::{limiter::Outcome, limits::defaults};
 
-use super::{aimd::multiplicative_decrease, defaults::MIN_SAMPLE_LATENCY, LimitAlgorithm, Sample};
+use super::{LimitAlgorithm, Sample, aimd::multiplicative_decrease, defaults::MIN_SAMPLE_LATENCY};
 
 /// Loss- and delay-based congestion avoidance.
 ///
@@ -109,6 +109,7 @@ impl Vegas {
     const DEFAULT_PROBE_MULTIPLIER: usize = 30;
 
     #[allow(missing_docs)]
+    #[must_use]
     pub fn new_with_initial_limit(initial_limit: usize) -> Self {
         Self::new(
             initial_limit,
@@ -117,6 +118,10 @@ impl Vegas {
     }
 
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `limit_range` start is less than 1, or if `initial_limit` is outside `limit_range`.
+    #[must_use]
     pub fn new(initial_limit: usize, limit_range: RangeInclusive<usize>) -> Self {
         assert!(*limit_range.start() >= 1, "Limits must be at least 1");
         assert!(
@@ -133,9 +138,17 @@ impl Vegas {
             min_limit: *limit_range.start(),
             max_limit: *limit_range.end(),
 
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "concurrency limit is bounded well within f64 precision"
+            )]
             alpha: Box::new(|limit| {
                 Self::DEFAULT_ALPHA_MULTIPLIER * (limit as f64).log10().max(1_f64)
             }),
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "concurrency limit is bounded well within f64 precision"
+            )]
             beta: Box::new(|limit| {
                 Self::DEFAULT_BETA_MULTIPLIER * (limit as f64).log10().max(1_f64)
             }),
@@ -151,6 +164,10 @@ impl Vegas {
     }
 
     #[allow(missing_docs)]
+    /// # Panics
+    ///
+    /// Panics if `max` is 0.
+    #[must_use]
     pub fn with_max_limit(self, max: usize) -> Self {
         assert!(max > 0);
         Self {
@@ -248,12 +265,20 @@ impl LimitAlgorithm for Vegas {
         }
 
         let update_limit = |limit: usize| {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "in_flight and limit are concurrency values bounded well within f64 precision"
+            )]
             let actual_rate = sample.in_flight as f64 / sample.latency.as_secs_f64();
 
             let extra_latency = sample.latency.as_secs_f64() - inner.base_latency.as_secs_f64();
 
             let estimated_queued_jobs = actual_rate * extra_latency;
 
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "in_flight and limit are concurrency values bounded well within f64 precision"
+            )]
             let utilisation = sample.in_flight as f64 / limit as f64;
 
             let increment = limit.ilog10().max(1) as usize;
@@ -281,6 +306,7 @@ impl LimitAlgorithm for Vegas {
         self.limit
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, update_limit)
             .expect("we always return Some(limit)");
+        drop(inner);
 
         self.limit.load(Ordering::SeqCst)
     }
@@ -292,6 +318,7 @@ impl Debug for Vegas {
             .field("limit", &self.limit)
             .field("min_limit", &self.min_limit)
             .field("max_limit", &self.max_limit)
+            .field("probe_multiplier", &self.probe_multiplier)
             .field("alpha(1)", &(self.alpha)(1))
             .field("beta(1)", &(self.beta)(1))
             .field("inner", &self.inner)
@@ -302,8 +329,6 @@ impl Debug for Vegas {
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, time::Duration};
-
-    use itertools::Itertools;
 
     use crate::limiter::{Limiter, Outcome};
 
@@ -431,7 +456,11 @@ mod tests {
             next_tokens.push_back(token);
         }
 
-        let release_tokens = next_tokens.drain(0..).collect_vec();
+        #[allow(
+            clippy::iter_with_drain,
+            reason = "VecDeque is reused after draining; into_iter() would move it"
+        )]
+        let release_tokens: Vec<_> = next_tokens.drain(..).collect();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(25));
             token.set_outcome(Outcome::Success).await;
@@ -443,7 +472,11 @@ mod tests {
         /*
          * Steady latency
          */
-        let release_tokens = next_tokens.drain(0..).collect_vec();
+        #[allow(
+            clippy::iter_with_drain,
+            reason = "VecDeque is reused after draining; into_iter() would move it"
+        )]
+        let release_tokens: Vec<_> = next_tokens.drain(..).collect();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(25));
             token.set_outcome(Outcome::Success).await;
@@ -455,14 +488,17 @@ mod tests {
         let higher_limit = limiter.state().limit();
         assert!(
             higher_limit > INIT_LIMIT,
-            "Steady latency + high concurrency => increase limit. Limit: {}",
-            higher_limit
+            "Steady latency + high concurrency => increase limit. Limit: {higher_limit}"
         );
 
         /*
          * 40x previous latency
          */
-        let release_tokens = next_tokens.drain(0..).collect_vec();
+        #[allow(
+            clippy::iter_with_drain,
+            reason = "VecDeque is reused after draining; into_iter() would move it"
+        )]
+        let release_tokens: Vec<_> = next_tokens.drain(..).collect();
         for mut token in release_tokens {
             token.set_latency(Duration::from_millis(1000));
             token.set_outcome(Outcome::Success).await;
@@ -474,8 +510,7 @@ mod tests {
         let lower_limit = limiter.state().limit();
         assert!(
             lower_limit < higher_limit,
-            "Increased latency => decrease limit. Limit: {}",
-            lower_limit
+            "Increased latency => decrease limit. Limit: {lower_limit}"
         );
     }
 }

@@ -2,8 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use congestion_limiter::{
     aggregation::Percentile,
-    limits::{Aimd, Fixed, Gradient, Vegas, Windowed},
     limiter::Limiter,
+    limits::{Aimd, Fixed, Gradient, Vegas, Windowed},
 };
 use statrs::distribution::Erlang;
 
@@ -30,25 +30,36 @@ pub fn build_limiter(algo: &str, initial_limit: usize) -> Arc<Limiter<LimitAlgo>
     let limit_algo = match algo {
         "aimd" => LimitAlgo::Aimd(Aimd::new_with_initial_limit(initial_limit)),
         "windowed_aimd" => LimitAlgo::WindowedAimd(
-            Windowed::new(Aimd::new_with_initial_limit(initial_limit), Percentile::default())
-                .with_min_window(Duration::from_millis(1))
-                .with_max_window(Duration::from_secs(1)),
+            Windowed::new(
+                Aimd::new_with_initial_limit(initial_limit),
+                Percentile::default(),
+            )
+            .with_min_window(Duration::from_millis(1))
+            .with_max_window(Duration::from_secs(1)),
         ),
         "vegas" => LimitAlgo::Vegas(Vegas::new_with_initial_limit(initial_limit)),
         "windowed_vegas" => LimitAlgo::WindowedVegas(
-            Windowed::new(Vegas::new_with_initial_limit(initial_limit), Percentile::default())
-                .with_min_window(Duration::from_millis(1))
-                .with_max_window(Duration::from_secs(1)),
+            Windowed::new(
+                Vegas::new_with_initial_limit(initial_limit),
+                Percentile::default(),
+            )
+            .with_min_window(Duration::from_millis(1))
+            .with_max_window(Duration::from_secs(1)),
         ),
         "gradient" => LimitAlgo::Gradient(Gradient::new_with_initial_limit(initial_limit)),
         "windowed_gradient" => LimitAlgo::WindowedGradient(
-            Windowed::new(Gradient::new_with_initial_limit(initial_limit), Percentile::default())
-                .with_min_window(Duration::from_millis(1))
-                .with_max_window(Duration::from_secs(1)),
+            Windowed::new(
+                Gradient::new_with_initial_limit(initial_limit),
+                Percentile::default(),
+            )
+            .with_min_window(Duration::from_millis(1))
+            .with_max_window(Duration::from_secs(1)),
         ),
         other => {
             eprintln!("Unknown algorithm: {other}");
-            eprintln!("Available algorithms: aimd, windowed_aimd, vegas, windowed_vegas, gradient, windowed_gradient");
+            eprintln!(
+                "Available algorithms: aimd, windowed_aimd, vegas, windowed_vegas, gradient, windowed_gradient"
+            );
             std::process::exit(1);
         }
     };
@@ -91,13 +102,13 @@ pub fn client_server(seed: u64, client_algo: &str, server_algo: &str) -> Simulat
         clients: vec![Client::new(
             0,
             LoadPattern::segments(vec![
-                (Duration::from_secs(120), 200.0),  // ramp up   1→200
-                (Duration::from_secs(120), 1.0),    // ramp down 200→1
-                (Duration::from_secs(30), 30.0),    // ease to 30 (calm before spike)
-                (Duration::ZERO, 300.0),             // spike to 300
-                (Duration::from_secs(90), 300.0),   // hold spike for 90s
-                (Duration::ZERO, 30.0),              // drop back to 30
-                (Duration::from_secs(90), 30.0),    // recover at 30 for 90s
+                (Duration::from_secs(120), 200.0), // ramp up   1→200
+                (Duration::from_secs(120), 1.0),   // ramp down 200→1
+                (Duration::from_secs(30), 30.0),   // ease to 30 (calm before spike)
+                (Duration::ZERO, 300.0),           // spike to 300
+                (Duration::from_secs(90), 300.0),  // hold spike for 90s
+                (Duration::ZERO, 30.0),            // drop back to 30
+                (Duration::from_secs(90), 30.0),   // recover at 30 for 90s
             ]),
             Some(build_limiter(client_algo, 5)),
         )],
@@ -124,7 +135,11 @@ pub fn convergence_start_high(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(120),
-        clients: vec![Client::new(0, LoadPattern::constant(200.0), Some(build_limiter(algo, 100)))],
+        clients: vec![Client::new(
+            0,
+            LoadPattern::constant(200.0),
+            Some(build_limiter(algo, 100)),
+        )],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -148,7 +163,11 @@ pub fn convergence_start_low(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(120),
-        clients: vec![Client::new(0, LoadPattern::constant(200.0), Some(build_limiter(algo, 2)))],
+        clients: vec![Client::new(
+            0,
+            LoadPattern::constant(200.0),
+            Some(build_limiter(algo, 2)),
+        )],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -174,14 +193,14 @@ pub fn load(seed: u64, algo: &str) -> Simulation {
         clients: vec![Client::new(
             0,
             LoadPattern::segments(vec![
-                (Duration::from_secs(90), 200.0),  // ramp up   1→200
-                (Duration::from_secs(90), 1.0),    // ramp down 200→1
-                (Duration::ZERO, 30.0),             // instant step to 30
-                (Duration::from_secs(30), 30.0),   // hold at 30 (calm before spike)
-                (Duration::ZERO, 300.0),            // instant spike to 300
-                (Duration::from_secs(90), 300.0),  // hold spike
-                (Duration::ZERO, 30.0),             // instant drop to 30
-                (Duration::from_secs(90), 30.0),   // recovery
+                (Duration::from_secs(90), 200.0), // ramp up   1→200
+                (Duration::from_secs(90), 1.0),   // ramp down 200→1
+                (Duration::ZERO, 30.0),           // instant step to 30
+                (Duration::from_secs(30), 30.0),  // hold at 30 (calm before spike)
+                (Duration::ZERO, 300.0),          // instant spike to 300
+                (Duration::from_secs(90), 300.0), // hold spike
+                (Duration::ZERO, 30.0),           // instant drop to 30
+                (Duration::from_secs(90), 30.0),  // recovery
             ]),
             Some(build_limiter(algo, 10)),
         )],
@@ -206,8 +225,8 @@ pub fn capacity(seed: u64, algo: &str) -> Simulation {
     let db_latency = Erlang::new(2, 100.0).expect("valid Erlang params");
 
     let db = Database::new(4, db_latency).with_capacity_timeline(vec![
-        (Duration::from_secs(40),  3), // gradual reduction: 4→3
-        (Duration::from_secs(80),  2), //                    3→2
+        (Duration::from_secs(40), 3),  // gradual reduction: 4→3
+        (Duration::from_secs(80), 2),  //                    3→2
         (Duration::from_secs(120), 1), //                    2→1 (fully degraded)
         (Duration::from_secs(180), 2), // gradual recovery:  1→2
         (Duration::from_secs(210), 3), //                    2→3
@@ -218,7 +237,11 @@ pub fn capacity(seed: u64, algo: &str) -> Simulation {
 
     Simulation {
         duration: Duration::from_secs(510),
-        clients: vec![Client::new(0, LoadPattern::constant(150.0), Some(build_limiter(algo, 10)))],
+        clients: vec![Client::new(
+            0,
+            LoadPattern::constant(150.0),
+            Some(build_limiter(algo, 10)),
+        )],
         server: Server {
             latency: Erlang::new(2, 10.0).expect("valid Erlang params"),
             failure_rate: FailureRate::Constant(0.001),
@@ -286,13 +309,25 @@ pub fn fairness(seed: u64, algo: &str) -> Simulation {
         Client::new(1, constant(), limiter()),
         Client::new(2, constant(), limiter()),
         // Gradual joiners.
-        Client::new(3, constant(), limiter()).active_from(Duration::from_secs(60)).active_until(Duration::from_secs(180)),
-        Client::new(4, constant(), limiter()).active_from(Duration::from_secs(80)).active_until(Duration::from_secs(200)),
-        Client::new(5, constant(), limiter()).active_from(Duration::from_secs(100)).active_until(Duration::from_secs(220)),
+        Client::new(3, constant(), limiter())
+            .active_from(Duration::from_secs(60))
+            .active_until(Duration::from_secs(180)),
+        Client::new(4, constant(), limiter())
+            .active_from(Duration::from_secs(80))
+            .active_until(Duration::from_secs(200)),
+        Client::new(5, constant(), limiter())
+            .active_from(Duration::from_secs(100))
+            .active_until(Duration::from_secs(220)),
         // Batch joiners.
-        Client::new(6, constant(), limiter()).active_from(Duration::from_secs(300)).active_until(Duration::from_secs(360)),
-        Client::new(7, constant(), limiter()).active_from(Duration::from_secs(300)).active_until(Duration::from_secs(360)),
-        Client::new(8, constant(), limiter()).active_from(Duration::from_secs(300)).active_until(Duration::from_secs(360)),
+        Client::new(6, constant(), limiter())
+            .active_from(Duration::from_secs(300))
+            .active_until(Duration::from_secs(360)),
+        Client::new(7, constant(), limiter())
+            .active_from(Duration::from_secs(300))
+            .active_until(Duration::from_secs(360)),
+        Client::new(8, constant(), limiter())
+            .active_from(Duration::from_secs(300))
+            .active_until(Duration::from_secs(360)),
     ];
 
     Simulation {
@@ -307,5 +342,45 @@ pub fn fairness(seed: u64, algo: &str) -> Simulation {
         },
         database: None,
         seed,
+    }
+}
+
+/// Dispatch to the right scenario constructor, printing usage and exiting on invalid input.
+pub fn build(scenario: &str, client_algo: Option<&str>, server_algo: Option<&str>, seed: u64) -> Simulation {
+    const ALGOS: &str = "aimd, windowed_aimd, vegas, windowed_vegas, gradient, windowed_gradient";
+    match (scenario, client_algo, server_algo) {
+        ("basic", _, _) => basic(seed),
+        ("client_server", Some(c), Some(s)) => client_server(seed, c, s),
+        ("client_server", _, _) => {
+            eprintln!("Scenario 'client_server' requires --client-algo and --server-algo");
+            eprintln!("Available algorithms: {ALGOS}");
+            std::process::exit(1);
+        }
+        ("convergence_start_high", Some(c), _) => convergence_start_high(seed, c),
+        ("convergence_start_low", Some(c), _) => convergence_start_low(seed, c),
+        ("load", Some(c), _) => load(seed, c),
+        ("capacity", Some(c), _) => capacity(seed, c),
+        ("high_variance", Some(c), _) => high_variance(seed, c),
+        ("fairness", Some(c), _) => fairness(seed, c),
+        (
+            s @ ("convergence_start_high"
+            | "convergence_start_low"
+            | "load"
+            | "capacity"
+            | "high_variance"
+            | "fairness"),
+            None,
+            _,
+        ) => {
+            eprintln!("Scenario '{s}' requires --client-algo <name>");
+            eprintln!("Available algorithms: {ALGOS}");
+            std::process::exit(1);
+        }
+        (other, _, _) => {
+            eprintln!("Unknown scenario: {other}");
+            eprintln!("Available scenarios: basic, client_server");
+            eprintln!("Scenarios requiring --client-algo: convergence_start_high, convergence_start_low, load, capacity, high_variance, fairness");
+            std::process::exit(1);
+        }
     }
 }

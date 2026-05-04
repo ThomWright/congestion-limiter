@@ -19,7 +19,11 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(id: usize, load_pattern: LoadPattern, limiter: Option<Arc<Limiter<LimitAlgo>>>) -> Self {
+    pub const fn new(
+        id: usize,
+        load_pattern: LoadPattern,
+        limiter: Option<Arc<Limiter<LimitAlgo>>>,
+    ) -> Self {
         Self {
             id,
             load_pattern,
@@ -30,13 +34,13 @@ impl Client {
     }
 
     /// Set the time (from simulation start) at which this client begins generating requests.
-    pub fn active_from(mut self, t: Duration) -> Self {
+    pub const fn active_from(mut self, t: Duration) -> Self {
         self.active_from = t;
         self
     }
 
     /// Set the time (from simulation start) at which this client stops generating requests.
-    pub fn active_until(mut self, t: Duration) -> Self {
+    pub const fn active_until(mut self, t: Duration) -> Self {
         self.active_until = Some(t);
         self
     }
@@ -45,7 +49,7 @@ impl Client {
     ///
     /// Returns `None` if the limiter is full.
     pub fn try_acquire(&self) -> Option<Token> {
-        self.limiter.as_ref().and_then(|l| l.try_acquire())
+        self.limiter.as_ref().and_then(Limiter::try_acquire)
     }
 
     /// Returns the current state of the client's limiter, if it has one.

@@ -1,6 +1,24 @@
 [workspace]
 members = ["simulator"]
 
+[workspace.lints.clippy]
+# Casts can cause subtle bugs
+as_underscore = "warn"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+# Lint groups
+cargo = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allowed: abbreviations in docs are not code terms
+doc_markdown = "allow"
+# Allowed: repeating the struct name in a field is sometimes the only natural name
+struct_field_names = "allow"
+# Allowed: if-let-else is often more readable than map_or
+option_if_let_else = "allow"
+
 [package]
 name = "congestion-limiter"
 version = "0.1.0"
@@ -34,10 +52,5 @@ tokio-test = "0.4.3"
 [build-dependencies]
 readme-rustdocifier = "0.1.0"
 
-[lints.clippy]
-# Casts can cause subtle bugs
-as_underscore = "warn"
-cast_lossless = "warn"
-cast_possible_truncation = "warn"
-cast_possible_wrap = "warn"
-cast_sign_loss = "warn"
+[lints]
+workspace = true

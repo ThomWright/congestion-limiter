@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    sync::{atomic, Arc},
+    sync::{Arc, atomic},
     time::Duration,
 };
 
@@ -27,7 +27,7 @@ pub struct PartitionedLimiter<T> {
 
 /// Divides up capacity between multiple weighted partitions.
 #[derive(Debug)]
-pub(crate) struct Scheduler<T> {
+pub struct Scheduler<T> {
     total_limiter: TotalLimiter<T>,
     partition_states: Vec<PartitionState>,
 }
@@ -57,7 +57,7 @@ where
     #[builder]
     pub fn new(
         limit_algo: T,
-        weights: Vec<f64>,
+        weights: &[f64],
         #[builder(default = usize::MAX)] max_queue_size: usize,
     ) -> Vec<Arc<Self>> {
         // TODO: explicitly allow or disallow borrowing?
@@ -78,6 +78,7 @@ where
     }
 
     /// The current state of the limiter.
+    #[must_use]
     pub fn state(&self) -> LimiterState {
         self.scheduler.state(self.state_index)
     }
@@ -85,6 +86,7 @@ where
     /// Try to immediately acquire a concurrency [Token].
     ///
     /// Returns `None` if there are none available.
+    #[must_use]
     pub fn try_acquire(self: &Arc<Self>) -> Option<Token> {
         self.scheduler
             .try_acquire(self.state_index)
@@ -116,7 +118,7 @@ where
     /// partitions of 25%, 25% and 50% of the total limit, respectively.
     ///
     /// `weights` must not be empty.
-    pub(crate) fn new(limit_algo: T, max_queue_size: usize, weights: Vec<f64>) -> Arc<Self> {
+    pub(crate) fn new(limit_algo: T, max_queue_size: usize, weights: &[f64]) -> Arc<Self> {
         assert!(!weights.is_empty(), "Must provide at least one weight");
 
         let total: f64 = weights.iter().sum();
@@ -133,7 +135,7 @@ where
             })
             .collect();
 
-        Arc::new(Scheduler {
+        Arc::new(Self {
             total_limiter,
             partition_states,
         })
@@ -198,9 +200,10 @@ impl<T: LimitAlgorithm + Send + 'static> Releaser for PartitionedLimiter<T> {
 impl PartitionState {
     fn state(&self, total_limit: CapacityUnit) -> LimiterState {
         #[allow(
+            clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "fraction is in [0,1] so the product is non-negative and bounded by total_limit"
+            reason = "total_limit is a concurrency limit bounded well within f64 precision; fraction is in [0,1] so the product is non-negative and bounded by total_limit"
         )]
         let limit = (total_limit as f64 * self.fraction).ceil() as CapacityUnit;
         let in_flight = self.in_flight();
@@ -241,10 +244,9 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(10);
 
-        let weights = vec![0.5, 0.5];
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
-            .weights(weights)
+            .weights(&[0.5, 0.5])
             .build();
 
         // Initial conditions
@@ -273,7 +275,7 @@ mod tests {
 
         // Dropping a token won't contribute a sample to the limiter algorithm,
         // only setting an outcome will.
-        assert_eq!(mock_algo.samples().await.len(), 1);
+        assert_eq!(mock_algo.samples().len(), 1);
     }
 
     #[tokio::test]
@@ -281,10 +283,9 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(4);
 
-        let weights = vec![0.5, 0.5];
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
-            .weights(weights)
+            .weights(&[0.5, 0.5])
             .build();
 
         // Initial conditions
@@ -325,10 +326,9 @@ mod tests {
         let mock_algo = Arc::new(MockLimitAlgorithm::default());
         mock_algo.set_limit(4);
 
-        let weights = vec![0.5, 0.5];
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
-            .weights(weights)
+            .weights(&[0.5, 0.5])
             .build();
 
         // Initial conditions
@@ -375,7 +375,7 @@ mod tests {
 
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
-            .weights(vec![1.0])
+            .weights(&[1.0])
             .build();
 
         let t1 = partitions[0].try_acquire().unwrap();
@@ -384,7 +384,7 @@ mod tests {
         let t2 = partitions[0].try_acquire().unwrap();
         t2.set_outcome(Outcome::Success).await;
 
-        let samples = mock_algo.samples().await;
+        let samples = mock_algo.samples();
         assert_eq!(samples[0].in_flight, 1, "first sample");
         assert_eq!(samples[1].in_flight, 1, "second sample: should not grow");
     }
@@ -399,7 +399,7 @@ mod tests {
 
         let partitions = PartitionedLimiter::builder()
             .limit_algo(Arc::clone(&mock_algo))
-            .weights(vec![1.0, 10.0])
+            .weights(&[1.0, 10.0])
             .build();
 
         // Exhaust all permits from partition 1.

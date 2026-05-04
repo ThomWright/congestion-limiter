@@ -2,7 +2,7 @@
 
 use std::{
     fmt::Debug,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -151,22 +151,25 @@ impl<T: LimitAlgorithm + Debug + Sync> Releaser for Limiter<T> {
 
 impl LimiterState {
     /// The current concurrency limit.
-    pub fn limit(&self) -> CapacityUnit {
+    #[must_use]
+    pub const fn limit(&self) -> CapacityUnit {
         self.limit
     }
     /// The amount of concurrency available to use.
-    pub fn available(&self) -> CapacityUnit {
+    #[must_use]
+    pub const fn available(&self) -> CapacityUnit {
         self.available
     }
     /// The number of jobs in flight.
-    pub fn in_flight(&self) -> CapacityUnit {
+    #[must_use]
+    pub const fn in_flight(&self) -> CapacityUnit {
         self.in_flight
     }
 }
 
 impl Outcome {
-    pub(crate) fn overloaded_or(self, other: Outcome) -> Outcome {
-        use Outcome::*;
+    pub(crate) const fn overloaded_or(self, other: Self) -> Self {
+        use Outcome::{Overload, Success};
         match (self, other) {
             (Success, Overload) => Overload,
             _ => self,
@@ -180,7 +183,7 @@ mod tests {
 
     use crate::{
         limiter::{Limiter, Outcome},
-        limits::{mock::MockLimitAlgorithm, Fixed, Sample},
+        limits::{Fixed, Sample, mock::MockLimitAlgorithm},
     };
 
     #[tokio::test]
@@ -203,7 +206,7 @@ mod tests {
         assert_eq!(limiter.state().limit, 10);
 
         assert_eq!(
-            mock_algo.samples().await,
+            mock_algo.samples(),
             vec![Sample {
                 in_flight: 1,
                 latency: Duration::from_secs(1),
